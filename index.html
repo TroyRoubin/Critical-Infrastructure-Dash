@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="refresh" content="900">
+  <title>Queensland Operational Picture</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+  <style>
+    :root{color-scheme:dark;--bg:#07111d;--panel:#0d1c2c;--panel2:#12263a;--line:#29445d;--text:#f4f8fb;--muted:#9eb2c4;--accent:#4cc2ff;--bad:#ff6b6b;--warn:#ffd166;--good:#52d69b}
+    *{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:15px/1.35 system-ui,-apple-system,Segoe UI,sans-serif}body{overflow:hidden}
+    header{height:68px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid var(--line);background:#091726}
+    h1{font-size:22px;margin:0;letter-spacing:.04em}.sub{color:var(--muted);font-size:12px}.updated{text-align:right}
+    main{height:calc(100% - 68px);display:grid;grid-template-columns:minmax(0,1fr) 410px;gap:10px;padding:10px}
+    .left{display:grid;grid-template-rows:auto minmax(0,1fr);gap:10px;min-width:0}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.card,.panel{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:10px}.card{padding:10px 12px}.card .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.card .value{font-size:27px;font-weight:750;margin-top:2px}.card .detail{font-size:11px;color:var(--muted)}
+    #map{height:100%;border-radius:10px;background:#0b1b2a}.right{display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:10px;min-height:0}.panel{padding:12px;min-height:0}.panel h2{font-size:14px;margin:0 0 9px;text-transform:uppercase;letter-spacing:.08em;color:#dbeaf5}
+    .controls{display:grid;grid-template-columns:1fr 1fr;gap:8px}.controls label{font-size:11px;color:var(--muted)}select,input{width:100%;margin-top:4px;background:#071522;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px}
+    .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}.chip{border:1px solid var(--line);background:#0a1928;color:var(--text);padding:6px 9px;border-radius:99px;cursor:pointer}.chip.active{border-color:var(--accent);background:#12334b}
+    #incidentList{overflow:auto;height:100%;padding-right:3px}.incident{padding:10px 4px;border-bottom:1px solid #20384c}.incident:last-child{border:0}.incident-head{display:flex;gap:8px;align-items:flex-start}.badge{font-size:10px;text-transform:uppercase;padding:3px 6px;border-radius:4px;background:#243d52;white-space:nowrap}.badge.power{background:#634d11}.badge.roads{background:#653333}.badge.rail{background:#3d3569}.badge.schools{background:#235343}.incident-title{font-weight:700}.incident-meta,.incident-desc{font-size:12px;color:var(--muted);margin-top:3px}.incident a{color:#8fd7ff;text-decoration:none}
+    .source{display:grid;grid-template-columns:1fr auto;gap:4px 10px;font-size:12px;padding:5px 0;border-bottom:1px solid #20384c}.source:last-child{border:0}.status{font-weight:700}.current{color:var(--good)}.fallback{color:var(--warn)}.error{color:var(--bad)}
+    .notice{position:absolute;z-index:1000;left:50%;top:82px;transform:translateX(-50%);max-width:700px;padding:9px 14px;border-radius:7px;background:#5b4212;border:1px solid #a77b23;color:#fff2c8;display:none}.empty{padding:24px 8px;color:var(--muted);text-align:center}
+    .leaflet-container{font:13px system-ui,sans-serif}.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:#102337;color:#fff}.leaflet-control-layers,.leaflet-bar a{background:#102337;color:#fff;border-color:#29445d}.leaflet-bar a:hover{background:#18344e;color:#fff}
+    @media(max-width:1000px){body{overflow:auto}main{height:auto;grid-template-columns:1fr}.left{height:720px}.right{grid-template-rows:auto 500px auto}.cards{grid-template-columns:repeat(2,1fr)}header{height:auto;min-height:68px}.updated{font-size:11px}}
+  </style>
+</head>
+<body>
+<header>
+  <div><h1>Queensland Operational Picture</h1><div class="sub">Public-source critical infrastructure situational awareness</div></div>
+  <div class="updated"><strong id="clock"></strong><div class="sub" id="updated">No data snapshot</div></div>
+</header>
+<div id="notice" class="notice"></div>
+<main>
+  <section class="left">
+    <div class="cards">
+      <div class="card"><div class="label">Road closures</div><div class="value" id="roadsValue">0</div><div class="detail" id="roadsDetail">0 restrictions</div></div>
+      <div class="card"><div class="label">Customers off supply</div><div class="value" id="powerValue">0</div><div class="detail" id="powerDetail">0 outages</div></div>
+      <div class="card"><div class="label">Rail disruptions</div><div class="value" id="railValue">0</div><div class="detail">significant reports</div></div>
+      <div class="card"><div class="label">Schools closed</div><div class="value" id="schoolValue">0</div><div class="detail">all sectors</div></div>
+      <div class="card"><div class="label">LGAs affected</div><div class="value" id="lgaValue">0</div><div class="detail">with mapped incidents</div></div>
+    </div>
+    <div id="map"></div>
+  </section>
+  <aside class="right">
+    <div class="panel">
+      <h2>Filters</h2>
+      <div class="controls">
+        <label>LGA<select id="lgaFilter"><option value="">All Queensland</option></select></label>
+        <label>Search<input id="search" type="search" placeholder="Road, suburb, school..."></label>
+      </div>
+      <div class="chips" id="sectorChips"></div>
+    </div>
+    <div class="panel"><h2>Active disruptions</h2><div id="incidentList"></div></div>
+    <div class="panel"><h2>Source health</h2><div id="sources"></div></div>
+  </aside>
+</main>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+const DASHBOARD_DATA = /*DATA_START*/{"generated_at":null,"notice":"The first GitHub workflow run will populate the live feeds automatically.","incidents":[],"lgas":{"type":"FeatureCollection","features":[]},"sources":{}}/*DATA_END*/;
+const sectors={roads:'Roads',power:'Power',rail:'Rail',schools:'Schools'};
+const colours={roads:'#ff7474',power:'#ffd166',rail:'#a997ff',schools:'#52d69b'};
+let activeSectors=new Set(Object.keys(sectors));let layers=[];let lgaLayer;
+const map=L.map('map',{zoomControl:true}).setView([-22.5,146.8],5);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const fmt=n=>Number(n||0).toLocaleString('en-AU');
+const date=v=>v?new Date(v).toLocaleString('en-AU',{timeZone:'Australia/Brisbane',dateStyle:'medium',timeStyle:'short'}):'Unknown';
+function incidentCount(name){return DASHBOARD_DATA.incidents.filter(i=>i.lga===name).length}
+function lgaStyle(feature){const n=incidentCount(feature.properties.display_name);return{color:'#5a7891',weight:1,fillColor:n>10?'#9d3146':n>4?'#9a6228':n?'#536b2b':'#173047',fillOpacity:n?.42:.17}}
+if(DASHBOARD_DATA.lgas?.features?.length){lgaLayer=L.geoJSON(DASHBOARD_DATA.lgas,{style:lgaStyle,onEachFeature:(f,l)=>{l.bindTooltip(`${esc(f.properties.display_name)}: ${incidentCount(f.properties.display_name)} incidents`);l.on('click',()=>{document.getElementById('lgaFilter').value=f.properties.display_name;render()})}}).addTo(map);map.fitBounds(lgaLayer.getBounds(),{padding:[10,10]})}
+function clearIncidentLayers(){layers.forEach(l=>map.removeLayer(l));layers=[]}
+function geometryLayer(i){if(!i.geometry)return null;try{return L.geoJSON({type:'Feature',geometry:i.geometry,properties:{}},{style:{color:colours[i.sector],weight:i.sector==='roads'?4:2,fillColor:colours[i.sector],fillOpacity:.18}})}catch{return null}}
+function markerLayer(i){if(!i.coordinates)return null;const radius=i.sector==='power'?Math.max(6,Math.min(22,5+Math.sqrt(i.customers||0)/4)):7;return L.circleMarker([i.coordinates[1],i.coordinates[0]],{radius,color:colours[i.sector],fillColor:colours[i.sector],fillOpacity:.8,weight:2})}
+function popup(i){return `<strong>${esc(i.title)}</strong><br>${esc(i.status||'')}<br>${esc(i.lga||i.locality||'Location not mapped')}${i.customers?`<br>${fmt(i.customers)} customers affected`:''}<br><a href="${esc(i.source_url)}" target="_blank" rel="noopener">Official source</a>`}
+function selected(){const lga=document.getElementById('lgaFilter').value;const q=document.getElementById('search').value.toLowerCase().trim();return DASHBOARD_DATA.incidents.filter(i=>activeSectors.has(i.sector)&&(!lga||i.lga===lga)&&(!q||`${i.title} ${i.description} ${i.locality} ${i.lga}`.toLowerCase().includes(q)))}
+function render(){const all=selected();clearIncidentLayers();all.forEach(i=>{const g=geometryLayer(i),m=markerLayer(i);[g,m].filter(Boolean).forEach(l=>{l.bindPopup(popup(i));l.addTo(map);layers.push(l)})});
+ const roads=all.filter(i=>i.sector==='roads'),power=all.filter(i=>i.sector==='power'),rail=all.filter(i=>i.sector==='rail'),schools=all.filter(i=>i.sector==='schools');
+ document.getElementById('roadsValue').textContent=fmt(roads.filter(i=>i.subtype==='closure').length);document.getElementById('roadsDetail').textContent=`${fmt(roads.filter(i=>i.subtype==='restriction').length)} restrictions`;
+ document.getElementById('powerValue').textContent=fmt(power.reduce((a,i)=>a+(i.customers||0),0));document.getElementById('powerDetail').textContent=`${fmt(power.length)} outages`;
+ document.getElementById('railValue').textContent=fmt(rail.length);document.getElementById('schoolValue').textContent=fmt(schools.length);document.getElementById('lgaValue').textContent=fmt(new Set(all.map(i=>i.lga).filter(Boolean)).size);
+ const list=document.getElementById('incidentList');list.innerHTML=all.length?all.sort((a,b)=>(b.customers||0)-(a.customers||0)||String(b.updated).localeCompare(String(a.updated))).map(i=>`<article class="incident"><div class="incident-head"><span class="badge ${esc(i.sector)}">${esc(sectors[i.sector]||i.sector)}</span><div><div class="incident-title">${esc(i.title)}</div><div class="incident-meta">${esc(i.lga||i.locality||'Location not mapped')}${i.customers?` · ${fmt(i.customers)} customers`:''} · ${esc(i.status||'')}</div></div></div>${i.description?`<div class="incident-desc">${esc(i.description)}</div>`:''}<div class="incident-meta">Updated ${esc(date(i.updated))} · <a href="${esc(i.source_url)}" target="_blank" rel="noopener">source</a></div></article>`).join(''):'<div class="empty">No matching disruptions.</div>'}
+Object.entries(sectors).forEach(([key,label])=>{const b=document.createElement('button');b.className='chip active';b.textContent=label;b.onclick=()=>{activeSectors.has(key)?activeSectors.delete(key):activeSectors.add(key);b.classList.toggle('active');render()};document.getElementById('sectorChips').appendChild(b)});
+const lgaNames=[...new Set([...(DASHBOARD_DATA.lgas?.features||[]).map(f=>f.properties.display_name),...DASHBOARD_DATA.incidents.map(i=>i.lga)].filter(Boolean))].sort();lgaNames.forEach(name=>{const o=document.createElement('option');o.value=o.textContent=name;document.getElementById('lgaFilter').appendChild(o)});
+document.getElementById('lgaFilter').onchange=()=>{const name=document.getElementById('lgaFilter').value;if(name&&lgaLayer){lgaLayer.eachLayer(l=>{if(l.feature.properties.display_name===name)map.fitBounds(l.getBounds(),{padding:[30,30]})})}render()};document.getElementById('search').oninput=render;
+const sourceBox=document.getElementById('sources');sourceBox.innerHTML=Object.entries(DASHBOARD_DATA.sources||{}).map(([key,s])=>`<div class="source"><span>${esc(s.name||key)} <small>(${fmt(s.count)})</small></span><span class="status ${esc(s.status)}">${esc(s.status||'unknown')}</span>${s.error?`<span class="sub" style="grid-column:1/3">${esc(s.error)}</span>`:''}</div>`).join('')||'<div class="empty">No source status yet.</div>';
+document.getElementById('updated').textContent=DASHBOARD_DATA.generated_at?`Snapshot updated ${date(DASHBOARD_DATA.generated_at)}`:'No data snapshot — waiting for the first GitHub refresh';if(!DASHBOARD_DATA.generated_at){const n=document.getElementById('notice');n.textContent=DASHBOARD_DATA.notice;n.style.display='block'}
+function clock(){document.getElementById('clock').textContent=new Date().toLocaleString('en-AU',{timeZone:'Australia/Brisbane',weekday:'short',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZoneName:'short'})}clock();setInterval(clock,1000);render();
+</script>
+</body>
+</html>
