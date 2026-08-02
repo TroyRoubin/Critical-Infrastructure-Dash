@@ -39,11 +39,11 @@ SOURCES = {
     },
     "energex": {
         "name": "Energex",
-        "url": "https://www.energex.com.au/static/PRD/ee_map_current_unplanned.geojson",
+        "url": "https://services.arcgis.com/bfVzktoY0OhzQCDj/ArcGIS/rest/services/VwEnergexOutages/FeatureServer/0/query",
     },
     "ergon": {
         "name": "Ergon Energy",
-        "url": "https://www.ergon.com.au/static/PRD/ee_map_current_unplanned.geojson",
+        "url": "https://services.arcgis.com/33eHbTVqo7gtiCE8/arcgis/rest/services/VwErgonOutages/FeatureServer/0/query",
     },
     "schools": {
         "name": "Queensland school closures",
@@ -63,6 +63,13 @@ SCHOOL_MAPSERVER = "https://spatial-gis.information.qld.gov.au/arcgis/rest/servi
 SCHOOL_LAYERS = (4, 5, 6, 7, 8, 9)
 DATA_START = "/*DATA_START*/"
 DATA_END = "/*DATA_END*/"
+POWER_ARCGIS_PARAMS = {
+    "where": "1=1",
+    "outFields": "*",
+    "returnGeometry": "true",
+    "outSR": "4326",
+    "f": "geojson",
+}
 
 
 def clean(value: Any) -> str:
@@ -173,9 +180,29 @@ def get_json(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def parse_date(value: Any) -> datetime | None:
+    # The ArcGIS outage layers return START and EST_FIX_TIME as Unix epoch
+    # milliseconds. Retain support for epoch seconds and the existing text dates.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(AEST)
+        except (OverflowError, OSError, ValueError):
+            return None
+
     text = clean(value)
     if not text:
         return None
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        try:
+            timestamp = float(text)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(AEST)
+        except (OverflowError, OSError, ValueError):
+            return None
+
     candidates = (text, text.replace("Z", "+00:00"))
     for candidate in candidates:
         try:
@@ -596,8 +623,8 @@ def main() -> int:
 
     jobs = [
         ("qldtraffic", lambda: parse_roads(get_json(SOURCES["qldtraffic"]["url"]), lgas)),
-        ("energex", lambda: parse_power(get_json(SOURCES["energex"]["url"]), "Energex", "energex", lgas)),
-        ("ergon", lambda: parse_power(get_json(SOURCES["ergon"]["url"]), "Ergon Energy", "ergon", lgas)),
+        ("energex", lambda: parse_power(get_json(SOURCES["energex"]["url"], POWER_ARCGIS_PARAMS), "Energex", "energex", lgas)),
+        ("ergon", lambda: parse_power(get_json(SOURCES["ergon"]["url"], POWER_ARCGIS_PARAMS), "Ergon Energy", "ergon", lgas)),
         ("schools", lambda: parse_schools(get_bytes(SOURCES["schools"]["url"]).decode("utf-8-sig"), lgas)),
         ("rail", lambda: parse_rail(get_bytes(SOURCES["rail"]["url"]))),
     ]
