@@ -13,6 +13,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import html
+import http.cookiejar
 import json
 import re
 import ssl
@@ -82,26 +83,86 @@ def stable_id(*parts: Any) -> str:
 
 
 def get_bytes(url: str, params: dict[str, Any] | None = None, timeout: int = 30) -> bytes:
+    """Retrieve a public feed using browser-like headers.
+
+    Energy Queensland's web firewall rejects obvious script user agents with
+    HTTP 403. For Energex and Ergon, establish a normal website session first,
+    retain its cookies, then request the GeoJSON with the same headers used by
+    a browser. Other feeds use the same opener without the warm-up request.
+    """
     if params:
-        url = f"{url}?{urllib.parse.urlencode(params)}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Queensland-Situational-Awareness-Dashboard/3.0",
-            "Accept": "application/geo+json, application/json, text/plain, application/xml, text/xml, */*",
-            "Accept-Language": "en-AU,en;q=0.9",
-        },
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}{urllib.parse.urlencode(params)}"
+
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    is_energy_qld = host in {"www.energex.com.au", "www.ergon.com.au"}
+    site_root = f"{parsed.scheme}://{parsed.netloc}"
+    referer = (
+        f"{site_root}/outages/outage-finder"
+        if host == "www.energex.com.au"
+        else f"{site_root}/network/outages/outage-finder"
+        if host == "www.ergon.com.au"
+        else site_root + "/"
     )
-    last_error: Exception | None = None
-    for attempt in range(2):
+
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/geo+json, application/json, text/plain, application/xml, text/xml, */*",
+        "Accept-Language": "en-AU,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": referer,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+    context = ssl.create_default_context()
+
+    # Warm up the Energy Queensland session so any edge/WAF cookies issued by
+    # the public outage page are sent with the subsequent GeoJSON request.
+    if is_energy_qld:
+        warm_headers = dict(browser_headers)
+        warm_headers.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+        })
         try:
-            with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
+            warm_request = urllib.request.Request(referer, headers=warm_headers)
+            with opener.open(warm_request, timeout=timeout, context=context) as response:
+                response.read(1024)
+        except Exception:
+            # The feed request may still succeed without the warm-up page.
+            pass
+
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            request_url = url
+            if is_energy_qld:
+                separator = "&" if "?" in request_url else "?"
+                request_url = f"{request_url}{separator}_={int(time.time())}"
+            request = urllib.request.Request(request_url, headers=browser_headers)
+            with opener.open(request, timeout=timeout, context=context) as response:
                 return response.read()
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            if attempt < 1:
-                time.sleep(2**attempt)
-    raise RuntimeError(f"Unable to retrieve {url}: {last_error}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+
+    hint = ""
+    if is_energy_qld and "403" in str(last_error):
+        hint = " (Energy Queensland blocked the GitHub runner despite browser headers)"
+    raise RuntimeError(f"Unable to retrieve {url}: {last_error}{hint}")
 
 
 def get_json(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
