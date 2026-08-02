@@ -123,8 +123,11 @@ def get_bytes(url: str, params: dict[str, Any] | None = None, timeout: int = 30)
     }
 
     cookie_jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
     context = ssl.create_default_context()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context),
+        urllib.request.HTTPCookieProcessor(cookie_jar),
+    )
 
     # Warm up the Energy Queensland session so any edge/WAF cookies issued by
     # the public outage page are sent with the subsequent GeoJSON request.
@@ -138,7 +141,7 @@ def get_bytes(url: str, params: dict[str, Any] | None = None, timeout: int = 30)
         })
         try:
             warm_request = urllib.request.Request(referer, headers=warm_headers)
-            with opener.open(warm_request, timeout=timeout, context=context) as response:
+            with opener.open(warm_request, timeout=timeout) as response:
                 response.read(1024)
         except Exception:
             # The feed request may still succeed without the warm-up page.
@@ -152,7 +155,7 @@ def get_bytes(url: str, params: dict[str, Any] | None = None, timeout: int = 30)
                 separator = "&" if "?" in request_url else "?"
                 request_url = f"{request_url}{separator}_={int(time.time())}"
             request = urllib.request.Request(request_url, headers=browser_headers)
-            with opener.open(request, timeout=timeout, context=context) as response:
+            with opener.open(request, timeout=timeout) as response:
                 return response.read()
         except Exception as exc:  # noqa: BLE001
             last_error = exc
