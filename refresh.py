@@ -26,11 +26,22 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python 3.8 fallback
+    ZoneInfo = None  # type: ignore[assignment]
+
+SCRIPT_VERSION = "2026-08-02-essential-translink-v4"
+
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "index.html"
 AEST = timezone(timedelta(hours=10))
+ESSENTIAL_TZ = ZoneInfo("Australia/Sydney") if ZoneInfo is not None else AEST
 NOW = datetime.now(AEST)
 NOW_ISO = NOW.isoformat(timespec="seconds")
+
+# Exact working Essential Energy KML feed used by the supplied ZIP pipeline.
+ESSENTIAL_ENERGY_KML_URL = "https://www.essentialenergy.com.au/Assets/kmz/current.kml?dFdLgoAP"
 
 SOURCES = {
     "qldtraffic": {
@@ -44,6 +55,10 @@ SOURCES = {
     "ergon": {
         "name": "Ergon Energy",
         "url": "https://services.arcgis.com/33eHbTVqo7gtiCE8/arcgis/rest/services/VwErgonOutages/FeatureServer/0/query",
+    },
+    "essential": {
+        "name": "Essential Energy",
+        "url": ESSENTIAL_ENERGY_KML_URL,
     },
     "schools": {
         "name": "Queensland school closures",
@@ -173,6 +188,36 @@ def get_bytes(url: str, params: dict[str, Any] | None = None, timeout: int = 30)
     if is_energy_qld and "403" in str(last_error):
         hint = " (Energy Queensland blocked the GitHub runner despite browser headers)"
     raise RuntimeError(f"Unable to retrieve {url}: {last_error}{hint}")
+
+
+def get_essential_kml(url: str = ESSENTIAL_ENERGY_KML_URL, timeout: int = 30) -> bytes:
+    """Retrieve Essential Energy's live KML using the working ZIP's headers."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/vnd.google-earth.kml+xml, application/xml, text/xml, */*",
+        "Accept-Language": "en-AU,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://www.essentialenergy.com.au/",
+    }
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
+                payload = response.read()
+            if b"<kml" not in payload[:5000].lower() and b"<placemark" not in payload.lower():
+                raise RuntimeError("Essential Energy response was not KML")
+            return payload
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Unable to retrieve Essential Energy KML: {last_error}")
 
 
 def get_json(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -447,6 +492,253 @@ def parse_power(payload: dict[str, Any], provider: str, source_key: str, lgas: d
     return incidents
 
 
+
+def parse_kml_coordinates(value: str) -> list[list[float]]:
+    """Convert KML lon,lat[,alt] coordinate text to GeoJSON positions."""
+    coordinates: list[list[float]] = []
+    for token in re.split(r"\s+", clean(value)):
+        parts = token.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            coordinates.append([float(parts[0]), float(parts[1])])
+        except ValueError:
+            continue
+    return coordinates
+
+
+def kml_placemark_geometry(placemark: ET.Element, namespace: dict[str, str]) -> dict[str, Any] | None:
+    """Extract the most useful GeoJSON geometry from an Essential Energy placemark."""
+    geometries: list[dict[str, Any]] = []
+
+    for polygon in placemark.findall(".//kml:Polygon", namespace):
+        rings: list[list[list[float]]] = []
+        outer = polygon.find("./kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", namespace)
+        if outer is not None and outer.text:
+            ring = parse_kml_coordinates(outer.text)
+            if ring:
+                if ring[0] != ring[-1]:
+                    ring.append(ring[0])
+                rings.append(ring)
+        for inner in polygon.findall("./kml:innerBoundaryIs/kml:LinearRing/kml:coordinates", namespace):
+            if inner.text:
+                ring = parse_kml_coordinates(inner.text)
+                if ring:
+                    if ring[0] != ring[-1]:
+                        ring.append(ring[0])
+                    rings.append(ring)
+        if rings:
+            geometries.append({"type": "Polygon", "coordinates": rings})
+
+    for point in placemark.findall(".//kml:Point/kml:coordinates", namespace):
+        if point.text:
+            coordinates = parse_kml_coordinates(point.text)
+            if coordinates:
+                geometries.append({"type": "Point", "coordinates": coordinates[0]})
+
+    for line in placemark.findall(".//kml:LineString/kml:coordinates", namespace):
+        if line.text:
+            coordinates = parse_kml_coordinates(line.text)
+            if coordinates:
+                geometries.append({"type": "LineString", "coordinates": coordinates})
+
+    if not geometries:
+        return None
+    if len(geometries) == 1:
+        return geometries[0]
+    return next((item for item in geometries if item.get("type") == "Polygon"), {
+        "type": "GeometryCollection",
+        "geometries": geometries,
+    })
+
+
+def decode_essential_html(value: Any) -> str:
+    """Decode the repeatedly escaped HTML stored in Essential Energy KML."""
+    text = clean(value)
+    text = text.replace("&amp;amp;lt;", "&amp;lt;").replace("&amp;amp;gt;", "&amp;gt;").replace("&amp;amp;amp;", "&amp;amp;")
+    for _ in range(5):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    return text
+
+
+def essential_plain_text(value: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", value, flags=re.I)
+    text = re.sub(r"</(?:div|p|h[1-6])\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    return "\n".join(clean(line) for line in html.unescape(text).splitlines() if clean(line))
+
+
+def essential_label_value(decoded_html: str, label: str) -> str:
+    pattern = re.compile(
+        r"<span[^>]*>\s*" + re.escape(label) + r"\s*</span>\s*(.*?)\s*</div>",
+        flags=re.I | re.S,
+    )
+    match = pattern.search(decoded_html)
+    return clean(essential_plain_text(match.group(1))) if match else ""
+
+
+def parse_essential_date(value: Any) -> datetime | None:
+    """Parse Essential Energy's NSW-local human-readable KML timestamps."""
+    text = clean(value)
+    if not text:
+        return None
+    normalized = re.sub(r"\s+", " ", text)
+    normalized = re.sub(r"\ba\.m\.\b", "AM", normalized, flags=re.I)
+    normalized = re.sub(r"\bp\.m\.\b", "PM", normalized, flags=re.I)
+    normalized = re.sub(r"\bam\b", "AM", normalized, flags=re.I)
+    normalized = re.sub(r"\bpm\b", "PM", normalized, flags=re.I)
+    formats = (
+        "%d/%m/%Y %I:%M:%S %p", "%d/%m/%Y %I:%M %p",
+        "%d/%m/%y %I:%M:%S %p", "%d/%m/%y %I:%M %p",
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
+        "%d/%m/%y %H:%M:%S", "%d/%m/%y %H:%M",
+        "%d %b %Y %I:%M %p", "%d %b %Y %H:%M",
+        "%I:%M%p %d %b %Y", "%I:%M %p %d %b %Y", "%H:%M %d %b %Y",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(normalized, fmt).replace(tzinfo=ESSENTIAL_TZ).astimezone(AEST)
+        except ValueError:
+            pass
+    return parse_date(normalized)
+
+
+def essential_fields(name: str, description: str) -> dict[str, Any]:
+    decoded = decode_essential_html(description)
+    plain = essential_plain_text(decoded)
+    heading_match = re.search(r"<h2[^>]*>(.*?)</h2>", decoded, flags=re.I | re.S)
+    incident = clean(essential_plain_text(heading_match.group(1))) if heading_match else clean(name)
+
+    labelled = {
+        "time_off": essential_label_value(decoded, "Time Off:"),
+        "estimated_restore": essential_label_value(decoded, "Est. Time On:"),
+        "customers": essential_label_value(decoded, "No. of Customers affected:"),
+        "reason": essential_label_value(decoded, "Reason:"),
+        "last_updated": essential_label_value(decoded, "Last Updated:"),
+    }
+    pairs: dict[str, str] = {}
+    for line in plain.splitlines():
+        match = re.match(r"^([^:]{2,80})\s*:\s*(.+)$", line)
+        if match:
+            pairs[norm(match.group(1))] = clean(match.group(2))
+
+    def first(*keys: str) -> str:
+        for key in keys:
+            value = pairs.get(norm(key))
+            if value:
+                return value
+        return ""
+
+    time_off = labelled["time_off"] or first("time off", "start", "started", "start time", "outage start")
+    estimated_restore = labelled["estimated_restore"] or first(
+        "est time on", "estimated restoration", "estimated restore", "etr", "finish", "end time"
+    )
+    customers_text = labelled["customers"] or first(
+        "no of customers affected", "customers affected", "affected customers", "customers", "customer count"
+    )
+    reason = labelled["reason"] or first("cause", "reason", "outage cause")
+    last_updated = labelled["last_updated"] or first("last updated", "updated")
+    suburb = first("suburb", "suburbs", "locality", "town")
+    streets = first("street", "streets", "location", "affected area")
+    status = first("status") or "Outage reported"
+
+    return {
+        "incident": incident,
+        "reason": reason,
+        "status": status,
+        "suburb": suburb,
+        "streets": streets,
+        "customers": parse_int(customers_text),
+        "time_off": parse_essential_date(time_off),
+        "estimated_restore": parse_essential_date(estimated_restore),
+        "last_updated": parse_essential_date(last_updated),
+    }
+
+
+def infer_essential_outage_type(style_url: Any) -> str | None:
+    """Classify Essential Energy placemarks exactly as the supplied ZIP does."""
+    style = clean(style_url).lower()
+    if "unplanned" in style:
+        return "unplanned"
+    if "planned" in style:
+        return "planned"
+    return None
+
+
+def parse_essential_power(kml_data: bytes, lgas: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only unplanned Essential Energy outages located in Queensland."""
+    root = ET.fromstring(kml_data)
+    namespace_uri = root.tag.split("}", 1)[0].lstrip("{") if root.tag.startswith("{") else "http://www.opengis.net/kml/2.2"
+    namespace = {"kml": namespace_uri}
+    incidents: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for placemark in root.findall(".//kml:Placemark", namespace):
+        name_node = placemark.find("kml:name", namespace)
+        description_node = placemark.find("kml:description", namespace)
+        style_node = placemark.find("kml:styleUrl", namespace)
+        name = clean(name_node.text if name_node is not None else "")
+        description = description_node.text if description_node is not None and description_node.text else ""
+        style_url = clean(style_node.text if style_node is not None else "")
+
+        # Essential's KML encodes planned/unplanned state in styleUrl. Keep only
+        # explicit unplanned records; planned and unknown styles are excluded.
+        if infer_essential_outage_type(style_url) != "unplanned":
+            continue
+
+        geometry = kml_placemark_geometry(placemark, namespace)
+        coords, footprint = power_geometry(geometry)
+        lga = locate_lga(coords, lgas)
+
+        # Essential Energy also covers NSW. A successful Queensland LGA match is
+        # required before the outage is allowed into the application.
+        if not lga:
+            continue
+
+        fields = essential_fields(name, description)
+        locality = clean(fields["suburb"] or fields["incident"] or name) or lga
+        event_id = stable_id(
+            "Essential Energy",
+            locality,
+            round(coords[0], 5) if coords else "",
+            round(coords[1], 5) if coords else "",
+            fields["time_off"] or "",
+        )
+        if event_id in seen:
+            continue
+        seen.add(event_id)
+
+        reason = clean(fields["reason"])
+        streets = clean(fields["streets"])
+        description_text = ". ".join(part for part in (
+            reason,
+            f"Affected area: {streets}" if streets else "",
+        ) if part)
+        incidents.append({
+            "id": f"power-essential-{event_id}",
+            "sector": "power",
+            "subtype": "unplanned",
+            "title": f"{title_case(locality)} unplanned power outage",
+            "description": description_text,
+            "status": clean(fields["status"]) or "Outage reported",
+            "lga": lga,
+            "locality": title_case(locality),
+            "coordinates": coords,
+            "geometry": footprint,
+            "customers": int(fields["customers"] or 0),
+            "planned": False,
+            "updated": iso(fields["last_updated"]) or NOW_ISO,
+            "estimated_restore": iso(fields["estimated_restore"]) or None,
+            "source_name": "Essential Energy",
+            "source_url": SOURCES["essential"]["url"],
+        })
+
+    return incidents
+
+
 def parse_school_sections(text: str) -> list[tuple[str, str]]:
     headings = {"state school closures": "State", "independent school closures": "Independent", "catholic school closures": "Catholic"}
     sector = None
@@ -537,37 +829,82 @@ def strip_html(value: str) -> str:
 
 
 def parse_rail(xml_data: bytes) -> list[dict[str, Any]]:
+    """Parse Translink's train-status RSS feed.
+
+    The current feed reports each line with a simple description value of
+    ``Major``, ``Minor`` or ``Normal``. Major and Minor are active service
+    disruptions; Normal is excluded. Older descriptive feed wording remains
+    supported as a fallback.
+    """
     root = ET.fromstring(xml_data)
-    incidents = []
-    terms = ("closed", "closure", "suspended", "not running", "no trains", "replacement bus", "cancelled", "canceled", "major delay", "track work")
+    channel = root.find("channel")
+    channel_pub_date = ""
+    if channel is not None:
+        pub_date_node = channel.find("pubDate")
+        channel_pub_date = clean(pub_date_node.text if pub_date_node is not None else "")
+    feed_updated = iso(channel_pub_date) or NOW_ISO
+
+    incidents: list[dict[str, Any]] = []
+    active_keywords = (
+        "closed",
+        "closure",
+        "suspended",
+        "not running",
+        "no trains",
+        "replacement bus",
+        "cancelled",
+        "canceled",
+        "delay",
+        "disruption",
+        "track work",
+    )
+    closure_keywords = ("closed", "closure", "suspended", "not running", "no trains")
+
     for item in root.findall(".//item"):
         def value(tag: str) -> str:
             element = item.find(tag)
             return clean(element.text if element is not None else "")
-        title = value("title") or "Rail service update"
-        description = strip_html(value("description"))
-        combined = norm(f"{title} {description}")
-        if not any(term in combined for term in terms):
+
+        line_name = value("title") or "Rail service"
+        raw_description = strip_html(value("description"))
+        status_key = norm(raw_description)
+        combined = norm(f"{line_name} {raw_description}")
+
+        # Current Translink status feed: retain Major and Minor, ignore Normal.
+        if status_key == "normal":
             continue
-        closure = any(term in combined for term in ("closed", "closure", "suspended", "not running", "no trains"))
+        if status_key in {"major", "minor"}:
+            is_active = True
+            is_closure = False
+            description = f"Translink feed status: {raw_description}."
+        else:
+            # Backwards-compatible handling for descriptive RSS messages.
+            is_active = any(keyword in combined for keyword in active_keywords)
+            if not is_active:
+                continue
+            is_closure = any(keyword in combined for keyword in closure_keywords)
+            description = raw_description or "Translink reports a train service disruption."
+
         link = value("link") or SOURCES["rail"]["url"]
+        item_updated = iso(value("pubDate")) or feed_updated
         incidents.append({
-            "id": f"rail-{stable_id(title, link)}",
+            "id": f"rail-{stable_id(line_name, link)}",
             "sector": "rail",
-            "subtype": "closure" if closure else "disruption",
-            "title": title,
+            "subtype": "closure" if is_closure else "disruption",
+            "title": f"{line_name} line service disruption",
             "description": description,
-            "status": "Closure / suspension" if closure else "Significant disruption",
+            "status": "Service disruption",
             "lga": None,
             "locality": "Queensland rail network",
             "coordinates": None,
             "geometry": None,
             "customers": 0,
             "planned": "track work" in combined or "planned" in combined,
-            "updated": iso(value("pubDate")) or NOW_ISO,
+            "updated": item_updated,
             "source_name": "Translink",
             "source_url": link,
         })
+
     return incidents
 
 
@@ -596,6 +933,7 @@ def source_result(name: str, status: str, count: int, error: str | None = None) 
 
 
 def main() -> int:
+    print(f"Refresh script version: {SCRIPT_VERSION}")
     if not INDEX.exists():
         print("index.html was not found beside refresh.py", file=sys.stderr)
         return 1
@@ -625,6 +963,7 @@ def main() -> int:
         ("qldtraffic", lambda: parse_roads(get_json(SOURCES["qldtraffic"]["url"]), lgas)),
         ("energex", lambda: parse_power(get_json(SOURCES["energex"]["url"], POWER_ARCGIS_PARAMS), "Energex", "energex", lgas)),
         ("ergon", lambda: parse_power(get_json(SOURCES["ergon"]["url"], POWER_ARCGIS_PARAMS), "Ergon Energy", "ergon", lgas)),
+        ("essential", lambda: parse_essential_power(get_essential_kml(), lgas)),
         ("schools", lambda: parse_schools(get_bytes(SOURCES["schools"]["url"]).decode("utf-8-sig"), lgas)),
         ("rail", lambda: parse_rail(get_bytes(SOURCES["rail"]["url"]))),
     ]
