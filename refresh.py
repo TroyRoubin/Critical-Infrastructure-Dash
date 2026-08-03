@@ -31,7 +31,7 @@ try:
 except ImportError:  # pragma: no cover - Python 3.8 fallback
     ZoneInfo = None  # type: ignore[assignment]
 
-SCRIPT_VERSION = "2026-08-02-essential-translink-v4"
+SCRIPT_VERSION = "2026-08-03-official-source-links-v5"
 
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "index.html"
@@ -84,6 +84,16 @@ POWER_ARCGIS_PARAMS = {
     "returnGeometry": "true",
     "outSR": "4326",
     "f": "geojson",
+}
+
+# Human-readable public pages used by incident hyperlinks. Feed/API URLs remain
+# in SOURCES for retrieval and source-health reporting only.
+OFFICIAL_SOURCE_URLS = {
+    "qldtraffic": "https://qldtraffic.qld.gov.au/?tab=incident",
+    "energex": "https://www.energex.com.au/outages/outage-finder",
+    "ergon": "https://www.ergon.com.au/network/outages/outage-finder/outage-finder-text-view",
+    "essential": "https://www.essentialenergy.com.au/outages-and-faults/power-outages",
+    "schools": "https://closures.qld.edu.au/",
 }
 
 
@@ -418,7 +428,7 @@ def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str,
             "planned": norm(props.get("event_type")) == "roadworks",
             "updated": iso(props.get("last_updated")) or NOW_ISO,
             "source_name": "QLDTraffic",
-            "source_url": clean(props.get("url") or props.get("web_link")) or SOURCES["qldtraffic"]["url"],
+            "source_url": OFFICIAL_SOURCE_URLS["qldtraffic"],
         })
     return incidents
 
@@ -487,7 +497,7 @@ def parse_power(payload: dict[str, Any], provider: str, source_key: str, lgas: d
             "updated": NOW_ISO,
             "estimated_restore": iso(property_value(props, "EST_FIX_TIME", "ESTIMATED_RESTORATION", "ETR")) or clean(property_value(props, "EST_FIX_TIME", "ESTIMATED_RESTORATION", "ETR")),
             "source_name": provider,
-            "source_url": SOURCES[source_key]["url"],
+            "source_url": OFFICIAL_SOURCE_URLS[source_key],
         })
     return incidents
 
@@ -733,7 +743,7 @@ def parse_essential_power(kml_data: bytes, lgas: dict[str, Any]) -> list[dict[st
             "updated": iso(fields["last_updated"]) or NOW_ISO,
             "estimated_restore": iso(fields["estimated_restore"]) or None,
             "source_name": "Essential Energy",
-            "source_url": SOURCES["essential"]["url"],
+            "source_url": OFFICIAL_SOURCE_URLS["essential"],
         })
 
     return incidents
@@ -818,7 +828,7 @@ def parse_schools(text: str, lgas: dict[str, Any]) -> list[dict[str, Any]]:
             "planned": False,
             "updated": NOW_ISO,
             "source_name": "Queensland Department of Education",
-            "source_url": "https://closures.qld.edu.au/",
+            "source_url": OFFICIAL_SOURCE_URLS["schools"],
             "school_sector": sector,
         })
     return incidents
