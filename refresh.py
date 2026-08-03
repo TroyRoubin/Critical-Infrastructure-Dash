@@ -90,7 +90,7 @@ POWER_ARCGIS_PARAMS = {
 # in SOURCES for retrieval and source-health reporting only.
 OFFICIAL_SOURCE_URLS = {
     "qldtraffic": "https://qldtraffic.qld.gov.au/?tab=incident",
-    "energex": "https://www.energex.com.au/outages/outage-finder",
+    "energex": "https://www.energex.com.au/outages/outage-finder/emergency-outages-text-view/",
     "ergon": "https://www.ergon.com.au/network/outages/outage-finder/outage-finder-text-view",
     "essential": "https://www.essentialenergy.com.au/outages-and-faults/power-outages",
     "schools": "https://closures.qld.edu.au/",
