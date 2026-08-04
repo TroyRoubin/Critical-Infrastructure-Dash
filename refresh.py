@@ -31,7 +31,7 @@ try:
 except ImportError:  # pragma: no cover - Python 3.8 fallback
     ZoneInfo = None  # type: ignore[assignment]
 
-SCRIPT_VERSION = "2026-08-04-kpi-trends-v1"
+SCRIPT_VERSION = "2026-08-05-operational-change-trends-v2"
 
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "index.html"
@@ -912,6 +912,10 @@ def parse_rail(xml_data: bytes) -> list[dict[str, Any]]:
             "title": f"{line_name} line service disruption",
             "description": description,
             "status": "Service disruption",
+            # Keep the source-reported operational state separately from the
+            # display label. Feed publication timestamps can change without the
+            # service condition changing; trend detection compares this field.
+            "impact_state": status_key if status_key in {"major", "minor"} else "active",
             "lga": None,
             "locality": "Queensland rail network",
             "coordinates": None,
@@ -983,6 +987,154 @@ def calculate_kpi_snapshot(incidents: list[dict[str, Any]], lgas: dict[str, Any]
         "schools": len(schools),
         "lgas": len(affected_lgas),
     }
+
+
+def incident_index(incidents: list[dict[str, Any]], sector: str) -> dict[str, dict[str, Any]]:
+    """Index stable incident identities for change detection."""
+    return {
+        clean(item.get("id")): item
+        for item in incidents
+        if item.get("sector") == sector and clean(item.get("id"))
+    }
+
+
+def rail_impact_level(incident: dict[str, Any]) -> int:
+    """Return an operational level without treating feed refreshes as changes.
+
+    Major is operationally worse than Minor. Older embedded records may not
+    contain ``impact_state``; infer it from their source text where possible,
+    otherwise return 0 so deployment of this version does not invent a change.
+    """
+    state = norm(incident.get("impact_state"))
+    if state == "major":
+        return 2
+    if state == "minor":
+        return 1
+    combined = norm(f"{incident.get('status')} {incident.get('description')}")
+    if re.search(r"\bmajor\b", combined):
+        return 2
+    if re.search(r"\bminor\b", combined):
+        return 1
+    return 0
+
+
+def affected_official_lgas(incidents: list[dict[str, Any]], lgas: dict[str, Any]) -> set[str]:
+    official_names = {
+        clean(feature.get("properties", {}).get("display_name"))
+        for feature in lgas.get("features", [])
+        if clean(feature.get("properties", {}).get("display_name"))
+    }
+    affected: set[str] = set()
+    for incident in incidents:
+        affected.update(incident_official_lgas(incident, official_names))
+    return affected
+
+
+def calculate_operational_changes(
+    previous_incidents: list[dict[str, Any]],
+    current_incidents: list[dict[str, Any]],
+    lgas: dict[str, Any],
+    since: str,
+    at: str,
+) -> dict[str, Any]:
+    """Calculate only new, worsened, improved, or resolved operational impact.
+
+    Routine source publication timestamps and text refreshes do not contribute.
+    The signed KPI trend is produced by subtracting ``*_down`` from ``*_up``.
+    """
+    previous_roads = incident_index(previous_incidents, "roads")
+    current_roads = incident_index(current_incidents, "roads")
+    previous_closures = {key for key, item in previous_roads.items() if item.get("subtype") == "closure"}
+    current_closures = {key for key, item in current_roads.items() if item.get("subtype") == "closure"}
+
+    previous_power = incident_index(previous_incidents, "power")
+    current_power = incident_index(current_incidents, "power")
+    power_up = 0
+    power_down = 0
+    power_events_up = 0
+    power_events_down = 0
+    for key in previous_power.keys() | current_power.keys():
+        before = max(0, int(previous_power.get(key, {}).get("customers") or 0))
+        after = max(0, int(current_power.get(key, {}).get("customers") or 0))
+        if after > before:
+            power_up += after - before
+            power_events_up += 1
+        elif before > after:
+            power_down += before - after
+            power_events_down += 1
+
+    previous_rail = incident_index(previous_incidents, "rail")
+    current_rail = incident_index(current_incidents, "rail")
+    rail_up = 0
+    rail_down = 0
+    for key in previous_rail.keys() | current_rail.keys():
+        before_item = previous_rail.get(key)
+        after_item = current_rail.get(key)
+        if before_item is None and after_item is not None:
+            rail_up += 1
+            continue
+        if before_item is not None and after_item is None:
+            rail_down += 1
+            continue
+        if before_item is None or after_item is None:
+            continue
+        before_level = rail_impact_level(before_item)
+        after_level = rail_impact_level(after_item)
+        # Unknown legacy state is treated as unchanged on deployment. Once both
+        # snapshots contain source states, Minor <-> Major changes are detected.
+        if before_level and after_level > before_level:
+            rail_up += 1
+        elif after_level and before_level > after_level:
+            rail_down += 1
+
+    previous_schools = set(incident_index(previous_incidents, "schools"))
+    current_schools = set(incident_index(current_incidents, "schools"))
+    previous_lgas = affected_official_lgas(previous_incidents, lgas)
+    current_lgas = affected_official_lgas(current_incidents, lgas)
+
+    return {
+        "since": since,
+        "at": at,
+        "roads_up": len(current_closures - previous_closures),
+        "roads_down": len(previous_closures - current_closures),
+        "power_customers_up": power_up,
+        "power_customers_down": power_down,
+        "power_events_up": power_events_up,
+        "power_events_down": power_events_down,
+        "rail_up": rail_up,
+        "rail_down": rail_down,
+        "schools_up": len(current_schools - previous_schools),
+        "schools_down": len(previous_schools - current_schools),
+        "lgas_up": len(current_lgas - previous_lgas),
+        "lgas_down": len(previous_lgas - current_lgas),
+    }
+
+
+def update_change_history(
+    previous: dict[str, Any],
+    previous_incidents: list[dict[str, Any]],
+    current_incidents: list[dict[str, Any]],
+    lgas: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Append operational-change observations and retain seven days."""
+    history = [
+        item for item in previous.get("change_history", [])
+        if isinstance(item, dict) and item.get("at")
+    ]
+    since = clean(previous.get("generated_at")) or NOW_ISO
+    current = calculate_operational_changes(previous_incidents, current_incidents, lgas, since, NOW_ISO)
+    if history and clean(history[-1].get("at")) == NOW_ISO:
+        history[-1] = current
+    else:
+        history.append(current)
+
+    cutoff = NOW - HISTORY_RETENTION
+    retained: list[dict[str, Any]] = []
+    for item in history:
+        item_at = parse_date(item.get("at"))
+        if item_at and item_at >= cutoff:
+            retained.append(item)
+    return retained[-HISTORY_MAX_POINTS:]
 
 
 def update_kpi_history(previous: dict[str, Any], incidents: list[dict[str, Any]], lgas: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1061,6 +1213,7 @@ def main() -> int:
             print(f"{SOURCES[key]['name']}: ERROR - {exc}")
 
     history = update_kpi_history(previous, incidents, lgas)
+    change_history = update_change_history(previous, previous_incidents, incidents, lgas)
     data = {
         "generated_at": NOW_ISO,
         "notice": "Snapshot refreshed automatically by GitHub. Scheduled runs occur every 15 minutes; individual source publication times may differ.",
@@ -1068,6 +1221,7 @@ def main() -> int:
         "lgas": lgas,
         "sources": sources,
         "history": history,
+        "change_history": change_history,
     }
     write_embedded(data)
     print(f"Updated {INDEX.name}: {len(incidents)} total incidents")
