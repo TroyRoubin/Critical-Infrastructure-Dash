@@ -31,7 +31,7 @@ try:
 except ImportError:  # pragma: no cover - Python 3.8 fallback
     ZoneInfo = None  # type: ignore[assignment]
 
-SCRIPT_VERSION = "2026-08-03-official-source-links-v5"
+SCRIPT_VERSION = "2026-08-04-kpi-trends-v1"
 
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "index.html"
@@ -95,6 +95,14 @@ OFFICIAL_SOURCE_URLS = {
     "essential": "https://www.essentialenergy.com.au/outages-and-faults/power-outages",
     "schools": "https://closures.qld.edu.au/",
 }
+
+# KPI history is embedded beside the current snapshot so GitHub Pages remains
+# self-contained. At a 15-minute refresh cadence, seven days is about 672 small
+# records and adds only a modest amount to index.html.
+HISTORY_RETENTION = timedelta(days=7)
+HISTORY_MIN_SPACING = timedelta(minutes=10)
+HISTORY_MAX_POINTS = 700
+LGA_ALIASES = {"Moreton Bay Regional": "City of Moreton Bay"}
 
 
 def clean(value: Any) -> str:
@@ -942,6 +950,66 @@ def source_result(name: str, status: str, count: int, error: str | None = None) 
     }
 
 
+def incident_official_lgas(incident: dict[str, Any], official_names: set[str]) -> set[str]:
+    """Return only official Queensland LGAs represented by an incident label."""
+    names: set[str] = set()
+    for raw_name in re.split(r"\s*/\s*|\s*;\s*", clean(incident.get("lga"))):
+        name = LGA_ALIASES.get(raw_name, raw_name)
+        if name in official_names:
+            names.add(name)
+    return names
+
+
+def calculate_kpi_snapshot(incidents: list[dict[str, Any]], lgas: dict[str, Any], at: str) -> dict[str, Any]:
+    """Create the compact statewide values used by the KPI trend visuals."""
+    roads = [item for item in incidents if item.get("sector") == "roads"]
+    power = [item for item in incidents if item.get("sector") == "power"]
+    rail = [item for item in incidents if item.get("sector") == "rail"]
+    schools = [item for item in incidents if item.get("sector") == "schools"]
+    official_names = {
+        clean(feature.get("properties", {}).get("display_name"))
+        for feature in lgas.get("features", [])
+        if clean(feature.get("properties", {}).get("display_name"))
+    }
+    affected_lgas: set[str] = set()
+    for incident in incidents:
+        affected_lgas.update(incident_official_lgas(incident, official_names))
+    return {
+        "at": at,
+        "roads": sum(1 for item in roads if item.get("subtype") == "closure"),
+        "power_customers": sum(int(item.get("customers") or 0) for item in power),
+        "power_outages": len(power),
+        "rail": len(rail),
+        "schools": len(schools),
+        "lgas": len(affected_lgas),
+    }
+
+
+def update_kpi_history(previous: dict[str, Any], incidents: list[dict[str, Any]], lgas: dict[str, Any]) -> list[dict[str, Any]]:
+    """Preserve, append and prune KPI history across scheduled refreshes."""
+    history = [item for item in previous.get("history", []) if isinstance(item, dict) and item.get("at")]
+
+    # Seed history from the last embedded snapshot when upgrading an existing
+    # dashboard, providing a comparison after the first run of this version.
+    if not history and previous.get("generated_at"):
+        history.append(calculate_kpi_snapshot(previous.get("incidents", []), lgas, clean(previous.get("generated_at"))))
+
+    current = calculate_kpi_snapshot(incidents, lgas, NOW_ISO)
+    last_at = parse_date(history[-1].get("at")) if history else None
+    if last_at and NOW - last_at < HISTORY_MIN_SPACING:
+        history[-1] = current
+    else:
+        history.append(current)
+
+    cutoff = NOW - HISTORY_RETENTION
+    retained = []
+    for item in history:
+        item_at = parse_date(item.get("at"))
+        if item_at and item_at >= cutoff:
+            retained.append(item)
+    return retained[-HISTORY_MAX_POINTS:]
+
+
 def main() -> int:
     print(f"Refresh script version: {SCRIPT_VERSION}")
     if not INDEX.exists():
@@ -992,12 +1060,14 @@ def main() -> int:
             sources[key] = source_result(key, "fallback" if fallback else "error", len(fallback), str(exc))
             print(f"{SOURCES[key]['name']}: ERROR - {exc}")
 
+    history = update_kpi_history(previous, incidents, lgas)
     data = {
         "generated_at": NOW_ISO,
         "notice": "Snapshot refreshed automatically by GitHub. Scheduled runs occur every 15 minutes; individual source publication times may differ.",
         "incidents": incidents,
         "lgas": lgas,
         "sources": sources,
+        "history": history,
     }
     write_embedded(data)
     print(f"Updated {INDEX.name}: {len(incidents)} total incidents")
