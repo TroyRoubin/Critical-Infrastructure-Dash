@@ -1,72 +1,96 @@
-name: Refresh and deploy dashboard
+name: Refresh dashboard
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - index.html
-      - refresh.py
-      - .github/workflows/update.yml
-  schedule:
-    # Every 15 minutes, offset from the busiest start-of-hour period.
-    - cron: "2,17,32,47 * * * *"
   workflow_dispatch:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - "index.html"
+      - "refresh.py"
+      - "requirements.txt"
+      - ".github/workflows/refresh-dashboard.yml"
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 concurrency:
-  group: qld-dashboard
+  group: critical-infrastructure-dashboard-refresh-main
   cancel-in-progress: false
 
 jobs:
-  refresh-and-deploy:
+  refresh-dashboard:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    timeout-minutes: 20
 
     steps:
-      - name: Get repository
-        uses: actions/checkout@v6
+      - name: Check out latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: Refresh live feeds
-        run: python refresh.py
-
-      - name: Save latest snapshot in the repository
+      - name: Install dependencies
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add index.html
-          if git diff --cached --quiet; then
-            echo "No snapshot change to commit."
-          else
-            git commit -m "data: refresh dashboard"
-            git push
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt
           fi
 
-      - name: Prepare site
+      - name: Refresh dashboard data
+        run: python refresh.py
+
+      - name: Commit and push refreshed dashboard
+        shell: bash
         run: |
-          mkdir _site
-          cp index.html _site/index.html
-          touch _site/.nojekyll
+          set -euo pipefail
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Upload site
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: _site
+          git add index.html
 
-      - name: Deploy site
-        id: deployment
-        uses: actions/deploy-pages@v4
+          if git diff --cached --quiet; then
+            echo "No dashboard changes to commit."
+            exit 0
+          fi
+
+          git commit -m "data: refresh dashboard"
+
+          for attempt in 1 2 3; do
+            echo "Push attempt ${attempt} of 3"
+
+            if git push origin HEAD:main; then
+              echo "Dashboard refresh pushed successfully."
+              exit 0
+            fi
+
+            echo "Remote main changed before the push completed."
+            echo "Rebuilding the refreshed dashboard from the latest main branch."
+
+            git fetch origin main
+            git reset --hard origin/main
+
+            python refresh.py
+            git add index.html
+
+            if git diff --cached --quiet; then
+              echo "The latest main branch already contains equivalent dashboard data."
+              exit 0
+            fi
+
+            git commit -m "data: refresh dashboard"
+            sleep $((attempt * 2))
+          done
+
+          echo "Unable to push the refreshed dashboard after three attempts."
+          exit 1
