@@ -31,7 +31,7 @@ try:
 except ImportError:  # pragma: no cover - Python 3.8 fallback
     ZoneInfo = None  # type: ignore[assignment]
 
-SCRIPT_VERSION = "2026-08-05-operational-change-trends-v2"
+SCRIPT_VERSION = "2026-08-05-operational-change-trends-v3"
 
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "index.html"
@@ -102,6 +102,7 @@ OFFICIAL_SOURCE_URLS = {
 HISTORY_RETENTION = timedelta(days=7)
 HISTORY_MIN_SPACING = timedelta(minutes=10)
 HISTORY_MAX_POINTS = 700
+CHANGE_HISTORY_VERSION = 3
 LGA_ALIASES = {"Moreton Bay Regional": "City of Moreton Bay"}
 
 
@@ -905,8 +906,14 @@ def parse_rail(xml_data: bytes) -> list[dict[str, Any]]:
 
         link = value("link") or SOURCES["rail"]["url"]
         item_updated = iso(value("pubDate")) or feed_updated
+        service_key = norm(line_name)
         incidents.append({
-            "id": f"rail-{stable_id(line_name, link)}",
+            # The RSS item URL can change whenever Translink republishes the
+            # feed. Identify a rail incident by its service/line instead, so an
+            # unchanged line is not counted as a newly disrupted line.
+            "id": f"rail-{stable_id(service_key)}",
+            "service_key": service_key,
+            "line_name": line_name,
             "sector": "rail",
             "subtype": "closure" if is_closure else "disruption",
             "title": f"{line_name} line service disruption",
@@ -998,6 +1005,43 @@ def incident_index(incidents: list[dict[str, Any]], sector: str) -> dict[str, di
     }
 
 
+def rail_service_key(incident: dict[str, Any]) -> str:
+    """Return a stable service identity for current and legacy rail records.
+
+    Translink's RSS links and publication timestamps may change even when the
+    operational state of a line does not. The line/service name is therefore
+    the change-detection identity.
+    """
+    explicit = norm(incident.get("service_key") or incident.get("line_name"))
+    if explicit:
+        return explicit
+
+    title = norm(incident.get("title"))
+    # Legacy titles were formatted as "<line> line service disruption".
+    title = re.sub(r"\bline service disruption\b$", "", title).strip()
+    title = re.sub(r"\bservice disruption\b$", "", title).strip()
+    title = re.sub(r"\bline\b$", "", title).strip()
+    if title:
+        return title
+
+    return clean(incident.get("id"))
+
+
+def rail_incident_index(incidents: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Index rail incidents by stable service name, never by mutable RSS URL."""
+    indexed: dict[str, dict[str, Any]] = {}
+    for item in incidents:
+        if item.get("sector") != "rail":
+            continue
+        key = rail_service_key(item)
+        if not key:
+            continue
+        existing = indexed.get(key)
+        if existing is None or rail_impact_level(item) > rail_impact_level(existing):
+            indexed[key] = item
+    return indexed
+
+
 def rail_impact_level(incident: dict[str, Any]) -> int:
     """Return an operational level without treating feed refreshes as changes.
 
@@ -1063,8 +1107,8 @@ def calculate_operational_changes(
             power_down += before - after
             power_events_down += 1
 
-    previous_rail = incident_index(previous_incidents, "rail")
-    current_rail = incident_index(current_incidents, "rail")
+    previous_rail = rail_incident_index(previous_incidents)
+    current_rail = rail_incident_index(current_incidents)
     rail_up = 0
     rail_down = 0
     for key in previous_rail.keys() | current_rail.keys():
@@ -1118,9 +1162,20 @@ def update_change_history(
 ) -> list[dict[str, Any]]:
     """Append operational-change observations and retain seven days."""
     history = [
-        item for item in previous.get("change_history", [])
+        dict(item) for item in previous.get("change_history", [])
         if isinstance(item, dict) and item.get("at")
     ]
+
+    # v2 matched rail incidents by RSS item URL. Because Translink may change
+    # those URLs on routine republication, v2 could record every active line as
+    # newly disrupted. Remove only those legacy rail deltas during migration;
+    # all other sector history remains intact.
+    previous_history_version = int(previous.get("change_history_version") or 0)
+    if previous_history_version < CHANGE_HISTORY_VERSION:
+        for item in history:
+            item["rail_up"] = 0
+            item["rail_down"] = 0
+
     since = clean(previous.get("generated_at")) or NOW_ISO
     current = calculate_operational_changes(previous_incidents, current_incidents, lgas, since, NOW_ISO)
     if history and clean(history[-1].get("at")) == NOW_ISO:
@@ -1222,6 +1277,7 @@ def main() -> int:
         "sources": sources,
         "history": history,
         "change_history": change_history,
+        "change_history_version": CHANGE_HISTORY_VERSION,
     }
     write_embedded(data)
     print(f"Updated {INDEX.name}: {len(incidents)} total incidents")
