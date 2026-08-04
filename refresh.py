@@ -31,7 +31,7 @@ try:
 except ImportError:  # pragma: no cover - Python 3.8 fallback
     ZoneInfo = None  # type: ignore[assignment]
 
-SCRIPT_VERSION = "2026-08-05-operational-change-trends-v3"
+SCRIPT_VERSION = "2026-08-05-operational-change-trends-v4"
 
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "index.html"
@@ -102,7 +102,7 @@ OFFICIAL_SOURCE_URLS = {
 HISTORY_RETENTION = timedelta(days=7)
 HISTORY_MIN_SPACING = timedelta(minutes=10)
 HISTORY_MAX_POINTS = 700
-CHANGE_HISTORY_VERSION = 3
+CHANGE_HISTORY_VERSION = 4
 LGA_ALIASES = {"Moreton Bay Regional": "City of Moreton Bay"}
 
 
@@ -906,17 +906,18 @@ def parse_rail(xml_data: bytes) -> list[dict[str, Any]]:
 
         link = value("link") or SOURCES["rail"]["url"]
         item_updated = iso(value("pubDate")) or feed_updated
-        service_key = norm(line_name)
+        service_key = canonical_rail_service_name(line_name)
+        display_line_name = re.sub(r"\s+line\s*$", "", clean(line_name), flags=re.I) or clean(line_name)
         incidents.append({
             # The RSS item URL can change whenever Translink republishes the
             # feed. Identify a rail incident by its service/line instead, so an
             # unchanged line is not counted as a newly disrupted line.
             "id": f"rail-{stable_id(service_key)}",
             "service_key": service_key,
-            "line_name": line_name,
+            "line_name": display_line_name,
             "sector": "rail",
             "subtype": "closure" if is_closure else "disruption",
-            "title": f"{line_name} line service disruption",
+            "title": f"{display_line_name} line service disruption",
             "description": description,
             "status": "Service disruption",
             # Keep the source-reported operational state separately from the
@@ -1005,24 +1006,34 @@ def incident_index(incidents: list[dict[str, Any]], sector: str) -> dict[str, di
     }
 
 
-def rail_service_key(incident: dict[str, Any]) -> str:
-    """Return a stable service identity for current and legacy rail records.
+def canonical_rail_service_name(value: Any) -> str:
+    """Normalise a Translink service name to one durable comparison key.
 
-    Translink's RSS links and publication timestamps may change even when the
-    operational state of a line does not. The line/service name is therefore
-    the change-detection identity.
+    Translink titles commonly include the word ``line`` while legacy dashboard
+    titles added another ``line service disruption`` suffix. Remove display
+    wording from every source before comparison so ``Airport``, ``Airport
+    line`` and ``Airport line line service disruption`` are one service.
     """
-    explicit = norm(incident.get("service_key") or incident.get("line_name"))
-    if explicit:
-        return explicit
+    key = norm(value)
+    previous = None
+    while key and key != previous:
+        previous = key
+        key = re.sub(r"\b(?:train|rail)?\s*line service disruption\b$", "", key).strip()
+        key = re.sub(r"\bservice disruption\b$", "", key).strip()
+        key = re.sub(r"\b(?:train|rail)?\s*line\b$", "", key).strip()
+    return key
 
-    title = norm(incident.get("title"))
-    # Legacy titles were formatted as "<line> line service disruption".
-    title = re.sub(r"\bline service disruption\b$", "", title).strip()
-    title = re.sub(r"\bservice disruption\b$", "", title).strip()
-    title = re.sub(r"\bline\b$", "", title).strip()
-    if title:
-        return title
+
+def rail_service_key(incident: dict[str, Any]) -> str:
+    """Return a stable service identity for current and legacy rail records."""
+    for value in (
+        incident.get("service_key"),
+        incident.get("line_name"),
+        incident.get("title"),
+    ):
+        key = canonical_rail_service_name(value)
+        if key:
+            return key
 
     return clean(incident.get("id"))
 
@@ -1166,18 +1177,28 @@ def update_change_history(
         if isinstance(item, dict) and item.get("at")
     ]
 
-    # v2 matched rail incidents by RSS item URL. Because Translink may change
-    # those URLs on routine republication, v2 could record every active line as
-    # newly disrupted. Remove only those legacy rail deltas during migration;
-    # all other sector history remains intact.
+    # Earlier versions could compare ``Airport line`` with the legacy title
+    # ``Airport line line service disruption`` and count every active service as
+    # newly disrupted. During the one-time v4 migration, remove those historical
+    # rail deltas and establish the current feed as the clean baseline. Other
+    # sector histories remain intact.
     previous_history_version = int(previous.get("change_history_version") or 0)
-    if previous_history_version < CHANGE_HISTORY_VERSION:
+    migrating_rail_history = previous_history_version < CHANGE_HISTORY_VERSION
+    if migrating_rail_history:
         for item in history:
             item["rail_up"] = 0
             item["rail_down"] = 0
+            item["schema_version"] = CHANGE_HISTORY_VERSION
 
     since = clean(previous.get("generated_at")) or NOW_ISO
     current = calculate_operational_changes(previous_incidents, current_incidents, lgas, since, NOW_ISO)
+    current["schema_version"] = CHANGE_HISTORY_VERSION
+    if migrating_rail_history:
+        # Baseline reset: do not infer a rail change while transitioning from
+        # incompatible legacy identities. Subsequent v4 runs compare canonical
+        # service names and detect only genuine new/worsened/resolved services.
+        current["rail_up"] = 0
+        current["rail_down"] = 0
     if history and clean(history[-1].get("at")) == NOW_ISO:
         history[-1] = current
     else:
