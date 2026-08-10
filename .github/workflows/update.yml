@@ -833,7 +833,7 @@ jobs:
           python /tmp/apply_marine_kpi.py
           python -m py_compile refresh.py
 
-      - name: Map Marine warning locations v3
+      - name: Map Marine warning locations v4
         shell: bash
         run: |
           set -euo pipefail
@@ -847,11 +847,11 @@ jobs:
 
           path = Path("refresh.py")
           text = path.read_text(encoding="utf-8")
-          marker = "# Marine map locations v3"
-          old_marker = "# Marine map locations v2"
+          marker = "# Marine map locations v4"
+          old_markers = ("# Marine map locations v3", "# Marine map locations v2")
 
           mapping_block = r"""
-          # Marine map locations v3
+          # Marine map locations v4
           # Coordinate order throughout the dashboard is GeoJSON order: [longitude, latitude].
           MSQ_QLD_BOUNDS = {
               "min_lon": 137.8,
@@ -991,15 +991,66 @@ jobs:
                   return point, lga or "Queensland LGA", lga, "lga"
               return list(MSQ_STATEWIDE_POINT), "Queensland maritime network (source location not specified)", None, "statewide"
 
+          def _msq_warning_parts(value: str) -> tuple[str | None, str | None, str | None]:
+              # Extract alert phase, warning level and operational direction from an MSQ title.
+              title = clean(value)
+              parts = [clean(part) for part in re.split(r"\s+(?:-|–|—)\s+", title) if clean(part)]
+              if not parts:
+                  return None, None, None
+
+              alert_phase = next((part for part in parts if "alert" in norm(part)), None)
+              warning_level = next((
+                  part for part in parts
+                  if any(term in norm(part) for term in ("emergency warning", "watch and act", "advice", "warning"))
+                  and part != alert_phase
+              ), None)
+              action = next((part for part in reversed(parts) if part not in {alert_phase, warning_level}), None)
+              return alert_phase, warning_level, action
+
+
+          def _msq_warning_detail(title: str, values: list[str]) -> str:
+              # Keep a richer source string when the dashboard exposes one for the same warning.
+              title_text = clean(title)
+              title_key = norm(title_text)
+              if not title_key:
+                  return ""
+
+              best = ""
+              for value in values:
+                  candidate = clean(html.unescape(str(value or "")))
+                  candidate = clean(
+                      candidate.replace(r"\n", " ")
+                      .replace(r"\r", " ")
+                      .replace(r"\t", " ")
+                      .replace(r'\"', '"')
+                  )
+                  candidate_key = norm(candidate)
+                  if not candidate_key or candidate_key == title_key:
+                      continue
+                  if title_key not in candidate_key:
+                      continue
+                  if len(candidate) <= len(title_text) + 8 or len(candidate) > 1200:
+                      continue
+                  if len(candidate) > len(best):
+                      best = candidate
+
+              if not best:
+                  return ""
+
+              # Avoid repeating the title when a dashboard payload is "title - details".
+              if best.lower().startswith(title_text.lower()):
+                  remainder = clean(best[len(title_text):].lstrip(" -:|–—"))
+                  if remainder:
+                      best = remainder
+              return best[:1200]
+
+
           def msq_marine_fallback_records(records: list[dict[str, Any]], lgas: dict[str, Any]) -> list[dict[str, Any]]:
-              # Upgrade cached Marine records so fallback warnings also appear on the map.
+              # Upgrade cached Marine records so fallback warnings retain rich display data and map cleanly.
               enriched: list[dict[str, Any]] = []
               for item in records:
                   record = dict(item)
                   if record.get("sector") != "marine":
-                      enriched.append(record)
-                      continue
-                  if _msq_point_in_qld(record.get("coordinates")):
                       enriched.append(record)
                       continue
 
@@ -1008,19 +1059,28 @@ jobs:
                       for field in ("title", "description", "locality")
                       if clean(record.get(field))
                   )
-                  coordinates, locality, lga, location_precision = _msq_warning_location(warning_text, lgas)
-                  record["coordinates"] = coordinates
-                  record["geometry"] = record.get("geometry") or None
-                  record["location_precision"] = location_precision
-                  if not clean(record.get("locality")) or norm(record.get("locality")) == "queensland maritime network":
-                      record["locality"] = locality
-                  if not clean(record.get("lga")) and lga:
-                      record["lga"] = lga
+                  alert_phase, warning_level, action = _msq_warning_parts(clean(record.get("title")))
+                  record["marine_alert_phase"] = record.get("marine_alert_phase") or alert_phase
+                  record["marine_warning_level"] = record.get("marine_warning_level") or warning_level
+                  record["marine_action"] = record.get("marine_action") or action
+
+                  if not _msq_point_in_qld(record.get("coordinates")):
+                      coordinates, locality, lga, location_precision = _msq_warning_location(warning_text, lgas)
+                      record["coordinates"] = coordinates
+                      record["geometry"] = record.get("geometry") or None
+                      record["location_precision"] = location_precision
+                      if not clean(record.get("locality")) or norm(record.get("locality")) == "queensland maritime network":
+                          record["locality"] = locality
+                      if not clean(record.get("lga")) and lga:
+                          record["lga"] = lga
+                  else:
+                      record["location_precision"] = record.get("location_precision") or "exact"
                   enriched.append(record)
               return enriched
 
+
           def parse_msq_marine_warnings(html_data: bytes, lgas: dict[str, Any]) -> list[dict[str, Any]]:
-              # Parse active MSQ warnings and attach a mappable Queensland location.
+              # Parse active MSQ warnings, retain richer source text where exposed, and attach a map location.
               raw = html_data.decode("utf-8-sig", errors="replace")
               if not clean(raw):
                   raise RuntimeError("MSQ dashboard returned an empty response")
@@ -1030,12 +1090,15 @@ jobs:
               visible_key = norm(" ".join(visible_lines))
               if any(phrase in visible_key for phrase in MSQ_NO_WARNING_PHRASES):
                   return []
+
               script_strings = []
               for match in re.finditer(r"[\"']([^\"'\r\n]{12,500})[\"']", raw):
                   value = match.group(1)
                   if "warning" in value.lower() or "alert" in value.lower() or "closed" in value.lower():
                       script_strings.append(value.replace(r"\u0026", "&").replace(r"\/", "/"))
-              warnings = _msq_unique_candidates(visible_lines + script_strings)
+
+              source_values = visible_lines + script_strings
+              warnings = _msq_unique_candidates(source_values)
               if not warnings:
                   shell_key = norm(raw)
                   if "maritime safety queensland" in shell_key or "powered by qit plus" in shell_key:
@@ -1044,11 +1107,14 @@ jobs:
                           "was not present in the server response"
                       )
                   raise RuntimeError("Unable to verify the active maritime-warning state from the MSQ dashboard")
+
               incidents = []
               for warning in warnings:
                   title = warning if len(warning) <= 170 else warning[:167].rstrip() + "…"
-                  description = "" if title == warning else warning
-                  coordinates, locality, lga, location_precision = _msq_warning_location(warning, lgas)
+                  source_detail = _msq_warning_detail(warning, source_values)
+                  description = source_detail or ("" if title == warning else warning)
+                  alert_phase, warning_level, action = _msq_warning_parts(warning)
+                  coordinates, locality, lga, location_precision = _msq_warning_location(warning + " " + description, lgas)
                   incidents.append({
                       "id": f"marine-{stable_id(warning)}",
                       "sector": "marine",
@@ -1057,6 +1123,9 @@ jobs:
                       "title": title,
                       "description": description,
                       "status": "Active maritime warning",
+                      "marine_alert_phase": alert_phase,
+                      "marine_warning_level": warning_level,
+                      "marine_action": action,
                       "lga": lga,
                       "locality": locality,
                       "coordinates": coordinates,
@@ -1072,13 +1141,14 @@ jobs:
           """
 
           if marker not in text:
-              if old_marker in text:
+              found_old_marker = next((item for item in old_markers if item in text), None)
+              if found_old_marker:
                   old_block = re.compile(
-                      r"(?ms)^# Marine map locations v2\n.*?(?=^def read_embedded\()"
+                      r"(?ms)^# Marine map locations v(?:2|3)\n.*?(?=^def read_embedded\()"
                   )
                   text, count = old_block.subn(lambda _match: mapping_block + "\n\n", text, count=1)
                   if count != 1:
-                      raise SystemExit("Marine mapping v3 could not replace the v2 mapping block.")
+                      raise SystemExit("Marine mapping v4 could not replace the earlier mapping block.")
               else:
                   function_pattern = re.compile(
                       r"(?ms)^def parse_msq_marine_warnings\([^\n]*\)"
@@ -1088,7 +1158,7 @@ jobs:
                   )
                   match = function_pattern.search(text)
                   if not match:
-                      raise SystemExit("Marine mapping v3 could not locate parse_msq_marine_warnings() in refresh.py.")
+                      raise SystemExit("Marine mapping v4 could not locate parse_msq_marine_warnings() in refresh.py.")
                   text = text[:match.start()] + mapping_block + "\n\n" + text[match.end():]
 
           old_job = '("marine", lambda: parse_msq_marine_warnings(get_bytes(SOURCES["marine"]["url"]))),'
@@ -1123,17 +1193,21 @@ jobs:
               "def msq_marine_fallback_records(records: list[dict[str, Any]], lgas: dict[str, Any])",
               '"coordinates": coordinates',
               '"location_precision": location_precision',
+              '"marine_alert_phase": alert_phase',
+              '"marine_warning_level": warning_level',
+              '"marine_action": action',
+              "def _msq_warning_detail(title: str, values: list[str])",
               new_job,
               'else msq_marine_fallback_records(previous_by_source.get(key, []), lgas)',
           )
           for token in required:
               if token not in text:
-                  raise SystemExit(f"Marine mapping v3 validation failed: missing {token!r}.")
+                  raise SystemExit(f"Marine mapping v4 validation failed: missing {token!r}.")
           if old_job in text:
-              raise SystemExit("Marine mapping v3 validation failed: old Marine job call remains.")
+              raise SystemExit("Marine mapping v4 validation failed: old Marine job call remains.")
           compile(text, str(path), "exec")
           path.write_text(text, encoding="utf-8")
-          print("Marine mapping v3 applied: live and cached warnings now carry map coordinates.")
+          print("Marine mapping v4 applied: Marine warnings now carry map coordinates and structured warning detail.")
           PY
           python /tmp/apply_marine_mapping.py
           python -m py_compile refresh.py
@@ -1487,6 +1561,174 @@ jobs:
           PY
           python /tmp/apply_multi_lga.py
 
+
+      - name: Enrich Marine warning details
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/apply_marine_details_ui.py <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("index.html")
+          text = path.read_text(encoding="utf-8")
+          marker = "/* Marine warning detail UI v1 */"
+
+          if marker in text:
+              print("Marine warning detail UI is already applied.")
+              raise SystemExit(0)
+
+          css_anchor = "    .incident-foot a{text-decoration:none}\n"
+          css_block = r'''    /* Marine warning detail UI v1 */
+              .marine-warning-chips{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-top:7px}
+              .marine-warning-chip{display:inline-flex;align-items:center;border:1px solid rgba(53,198,187,.34);border-radius:6px;padding:3px 6px;background:rgba(53,198,187,.10);color:#8be4dd;font-size:9px;font-weight:850;letter-spacing:.055em;text-transform:uppercase}
+              .marine-warning-chip.alert-red{border-color:rgba(255,91,91,.48);background:rgba(255,91,91,.13);color:#ffaaaa}
+              .marine-warning-chip.alert-orange{border-color:rgba(255,171,64,.48);background:rgba(255,171,64,.13);color:#ffd08d}
+              .marine-warning-chip.alert-yellow{border-color:rgba(240,207,82,.48);background:rgba(240,207,82,.13);color:#f8df82}
+              .marine-warning-detail{margin-top:8px;padding:8px 9px;border:1px solid rgba(53,198,187,.20);border-radius:8px;background:rgba(53,198,187,.055)}
+              .marine-warning-row{display:grid;grid-template-columns:78px minmax(0,1fr);gap:7px;margin-top:4px;font-size:10.5px;line-height:1.4}
+              .marine-warning-row:first-child{margin-top:0}
+              .marine-warning-key{color:var(--quiet);font-weight:750;text-transform:uppercase;letter-spacing:.045em;font-size:9px}
+              .marine-warning-value{color:#d2e4eb;min-width:0}
+              .marine-warning-body{margin-top:7px;color:#c4d8e1;font-size:11px;line-height:1.45;white-space:normal;overflow-wrap:anywhere}
+              .marine-location-note{margin-top:7px;color:#8fa8b5;font-size:10px;line-height:1.4;font-style:italic}
+              .marine-popup-shell{min-width:260px;max-width:330px}
+              .marine-popup-shell .marine-warning-detail{margin-top:7px;padding:7px 8px}
+              .marine-popup-shell .marine-warning-row{grid-template-columns:66px minmax(0,1fr);font-size:10px}
+              .marine-popup-shell .marine-warning-body{font-size:10.5px;max-height:110px;overflow:auto;padding-right:2px}
+              .marine-popup-updated{margin-top:7px;color:#829ba8;font-size:9.5px}
+              html[data-theme="light"] .marine-warning-chip{background:#e8f7f5;border-color:#a7dcd7;color:#176d68}
+              html[data-theme="light"] .marine-warning-chip.alert-red{background:#fff0f0;border-color:#efb3b3;color:#a92b2b}
+              html[data-theme="light"] .marine-warning-chip.alert-orange{background:#fff5e8;border-color:#efc58e;color:#96590b}
+              html[data-theme="light"] .marine-warning-chip.alert-yellow{background:#fff9dd;border-color:#dfcb6e;color:#786409}
+              html[data-theme="light"] .marine-warning-detail{background:#f1f9f8;border-color:#c5e6e2}
+              html[data-theme="light"] .marine-warning-value{color:#294957}
+              html[data-theme="light"] .marine-warning-body{color:#405a69}
+              html[data-theme="light"] .marine-location-note,html[data-theme="light"] .marine-popup-updated{color:#687f8b}
+          '''
+          if css_anchor not in text:
+              raise SystemExit("Marine detail UI patch could not find incident CSS anchor.")
+          text = text.replace(css_anchor, css_anchor + css_block, 1)
+
+          popup_pattern = re.compile(
+              r'(?ms)^    function popup\(incident\)\{.*?^    \}\n(?=    function createMarker\(incident\)\{)'
+          )
+          popup_match = popup_pattern.search(text)
+          if not popup_match:
+              raise SystemExit("Marine detail UI patch could not locate popup().")
+
+          popup_replacement = r'''    function marineWarningInfo(incident){
+              if(incident?.sector !== 'marine') return null;
+              const raw = String(incident.title || '').trim();
+              const parts = raw.split(/\s+[-–—]\s+/).map(part => part.trim()).filter(Boolean);
+              const alert = incident.marine_alert_phase || parts.find(part => /alert/i.test(part)) || '';
+              const level = incident.marine_warning_level || parts.find(part => /(emergency warning|watch and act|advice|warning)/i.test(part) && part !== alert) || '';
+              const action = incident.marine_action || [...parts].reverse().find(part => part !== alert && part !== level) || '';
+              return {alert,level,action};
+            }
+            function marineAlertClass(alert){
+              const value = String(alert || '').toLowerCase();
+              if(value.includes('red')) return ' alert-red';
+              if(value.includes('orange')) return ' alert-orange';
+              if(value.includes('yellow')) return ' alert-yellow';
+              return '';
+            }
+            function marineLocationNote(incident){
+              if(incident?.sector !== 'marine') return '';
+              const precision = String(incident.location_precision || '').toLowerCase();
+              if(precision === 'exact') return 'Map location is based on coordinates identified in the MSQ warning.';
+              if(precision === 'representative') return 'Map marker is an approximate reference point for the named maritime area.';
+              if(precision === 'lga') return 'Map marker is an approximate representative point for the affected LGA.';
+              if(precision === 'statewide') return 'MSQ did not specify a mappable area in the warning text; the marker is a statewide reference point.';
+              return '';
+            }
+            function marineWarningChips(incident){
+              const info = marineWarningInfo(incident);
+              if(!info) return '';
+              const alert = info.alert ? `<span class="marine-warning-chip${marineAlertClass(info.alert)}">${esc(info.alert)}</span>` : '';
+              const level = info.level ? `<span class="marine-warning-chip">${esc(info.level)}</span>` : '';
+              return alert || level ? `<div class="marine-warning-chips">${alert}${level}</div>` : '';
+            }
+            function marineWarningDetailHtml(incident,{popup=false}={}){
+              const info = marineWarningInfo(incident);
+              if(!info) return '';
+              const rows = [];
+              if(info.action) rows.push(`<div class="marine-warning-row"><span class="marine-warning-key">Direction</span><span class="marine-warning-value">${esc(info.action)}</span></div>`);
+              const location = incidentLocation(incident);
+              if(location) rows.push(`<div class="marine-warning-row"><span class="marine-warning-key">Area</span><span class="marine-warning-value">${esc(location)}</span></div>`);
+              rows.push(`<div class="marine-warning-row"><span class="marine-warning-key">Status</span><span class="marine-warning-value">${esc(incident.status || 'Active maritime warning')}</span></div>`);
+              const body = incident.description ? `<div class="marine-warning-body">${esc(incident.description)}</div>` : '';
+              const locationNote = marineLocationNote(incident);
+              const note = locationNote ? `<div class="marine-location-note">${esc(locationNote)}</div>` : '';
+              const updated = popup ? `<div class="marine-popup-updated">Updated ${esc(formatDate(incident.updated))} · ${esc(incident.source_name || 'Maritime Safety Queensland')}</div>` : '';
+              return `${marineWarningChips(incident)}<div class="marine-warning-detail">${rows.join('')}${body}${note}</div>${updated}`;
+            }
+            function popup(incident){
+              const sector = SECTORS[incident.sector] || {label:incident.sector,colour:'#6f9eb8',soft:'rgba(111,158,184,.14)'};
+              const customerText = incident.customers ? `<div class="popup-meta">${fmt(incident.customers)} customers affected</div>` : '';
+              const plannedText = incident.planned ? `<div class="popup-meta">Planned activity</div>` : '';
+              if(incident.sector === 'marine'){
+                return `<div class="marine-popup-shell" style="--popup:${sector.colour};--popup-soft:${sector.soft}">
+                  <div class="popup-impact">${esc(sector.label)}</div>
+                  <div class="popup-title">${esc(incident.title)}</div>
+                  ${marineWarningDetailHtml(incident,{popup:true})}
+                  <a class="popup-link" href="${esc(officialSourceUrl(incident))}" target="_blank" rel="noopener">Open official source</a>
+                </div>`;
+              }
+              return `<div style="--popup:${sector.colour};--popup-soft:${sector.soft}">
+                <div class="popup-impact">${esc(sector.label)}</div>
+                <div class="popup-title">${esc(incident.title)}</div>
+                <div class="popup-status">${esc(incident.status || '')}</div>
+                <div class="popup-meta">${esc(incidentLocation(incident))}</div>
+                ${customerText}${plannedText}
+                <a class="popup-link" href="${esc(officialSourceUrl(incident))}" target="_blank" rel="noopener">Open official source</a>
+              </div>`;
+            }
+          '''
+          text = text[:popup_match.start()] + popup_replacement + text[popup_match.end():]
+
+          card_pattern = re.compile(
+              r'(?ms)^    function incidentCard\(incident\)\{.*?^    \}\n(?=    function renderList\(incidents\)\{)'
+          )
+          card_match = card_pattern.search(text)
+          if not card_match:
+              raise SystemExit("Marine detail UI patch could not locate incidentCard().")
+
+          card_replacement = r'''    function incidentCard(incident){
+              const sector = SECTORS[incident.sector] || {label:incident.sector,colour:'#6f9eb8',soft:'rgba(111,158,184,.14)'};
+              const customerText = incident.customers ? ` · ${fmt(incident.customers)} customers` : '';
+              const description = incident.description && incident.sector !== 'marine' ? `<div class="incident-desc">${esc(incident.description)}</div>` : '';
+              const planned = incident.planned ? '<span class="plan-label">Planned</span>' : '';
+              const marineDetail = incident.sector === 'marine' ? marineWarningDetailHtml(incident) : '';
+              return `<article class="incident${state.selectedId === incident.id ? ' selected' : ''}" data-id="${esc(incident.id)}" style="--sector-colour:${sector.colour};--sector-soft:${sector.soft}">
+                <div class="incident-top">
+                  <div class="labels"><span class="sector-label">${esc(sector.label)}</span>${planned}</div>
+                </div>
+                <div class="incident-title">${esc(incident.title)}</div>
+                <div class="incident-meta">${esc(incidentLocation(incident))}${customerText} · ${esc(incident.status || '')}</div>
+                ${marineDetail}${description}
+                <div class="incident-foot"><span>Updated ${esc(formatDate(incident.updated))}</span><a href="${esc(officialSourceUrl(incident))}" target="_blank" rel="noopener">Official source</a></div>
+              </article>`;
+            }
+          '''
+          text = text[:card_match.start()] + card_replacement + text[card_match.end():]
+
+          required = (
+              marker,
+              "function marineWarningInfo(incident)",
+              "function marineWarningDetailHtml(incident,{popup=false}={})",
+              "MSQ did not specify a mappable area in the warning text",
+              'class="marine-popup-shell"',
+              "incident.sector === 'marine' ? marineWarningDetailHtml(incident) : ''",
+          )
+          for token in required:
+              if token not in text:
+                  raise SystemExit(f"Marine detail UI validation failed: missing {token!r}.")
+
+          path.write_text(text, encoding="utf-8")
+          print("Marine warning detail UI applied to Active Disruptions and map popups.")
+          PY
+          python /tmp/apply_marine_details_ui.py
 
       - name: Rename dashboard
         shell: bash
