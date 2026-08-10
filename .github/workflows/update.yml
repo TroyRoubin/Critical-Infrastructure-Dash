@@ -1462,6 +1462,164 @@ jobs:
           python /tmp/apply_msq_verified_source.py
           python -m py_compile refresh.py
 
+      - name: Add Marine KPI trend
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/apply_marine_trend.py <<'PY'
+          #!/usr/bin/env python3
+          """Add Marine warning count to the existing KPI trend/history system."""
+          from __future__ import annotations
+
+          from pathlib import Path
+          import re
+
+          REFRESH = Path("refresh.py")
+          INDEX = Path("index.html")
+          REFRESH_MARKER = "# Marine KPI trend history v1"
+          INDEX_MARKER = "<!-- Marine KPI trend v1 -->"
+
+
+          def patch_refresh(text: str) -> tuple[str, bool]:
+              changed = False
+              function_pattern = re.compile(
+                  r"(?ms)^def calculate_kpi_snapshot\([^\n]*\).*?(?=^def [A-Za-z_][A-Za-z0-9_]*\(|\Z)"
+              )
+              match = function_pattern.search(text)
+              if not match:
+                  raise RuntimeError("Marine trend patch could not locate calculate_kpi_snapshot().")
+
+              block = match.group(0)
+              if REFRESH_MARKER not in block:
+                  schools_line = '    schools = [item for item in incidents if item.get("sector") == "schools"]\n'
+                  if schools_line not in block:
+                      raise RuntimeError("Marine trend patch could not find the schools KPI snapshot anchor.")
+                  block = block.replace(
+                      schools_line,
+                      schools_line
+                      + f"    {REFRESH_MARKER}\n"
+                      + '    marine = [item for item in incidents if item.get("sector") == "marine"]\n',
+                      1,
+                  )
+                  changed = True
+
+              if '"marine": len(marine),' not in block:
+                  history_anchor = '        "schools": len(schools),\n        "lgas": len(affected_lgas),\n'
+                  if history_anchor not in block:
+                      raise RuntimeError("Marine trend patch could not find the KPI history return anchor.")
+                  block = block.replace(
+                      history_anchor,
+                      '        "schools": len(schools),\n'
+                      '        "marine": len(marine),\n'
+                      '        "lgas": len(affected_lgas),\n',
+                      1,
+                  )
+                  changed = True
+
+              text = text[:match.start()] + block + text[match.end():]
+              if REFRESH_MARKER not in text or '"marine": len(marine),' not in text:
+                  raise RuntimeError("Marine trend refresh validation failed.")
+              compile(text, str(REFRESH), "exec")
+              return text, changed
+
+
+          def patch_index(text: str) -> tuple[str, bool]:
+              changed = False
+
+              marine_card_pattern = re.compile(
+                  r'(?ms)(<article\b[^>]*data-kpi-sector=["\']marine["\'][^>]*>.*?</article>)'
+              )
+              cards = list(marine_card_pattern.finditer(text))
+              if len(cards) != 1:
+                  raise RuntimeError(f"Marine trend patch expected one Marine KPI card; found {len(cards)}.")
+
+              card_match = cards[0]
+              card = card_match.group(1)
+              if 'id="marineTrend"' not in card:
+                  close_index = card.rfind("</article>")
+                  if close_index < 0:
+                      raise RuntimeError("Marine trend patch could not find the Marine card closing tag.")
+                  indent_match = re.search(r'(?m)^(\s*)<div class="metric-detail" id="marineDetail"', card)
+                  indent = indent_match.group(1) if indent_match else "          "
+                  trend_html = (
+                      f'{indent}{INDEX_MARKER}\n'
+                      f'{indent}<div class="metric-trend trend-pending" id="marineTrend" aria-live="polite">'
+                      '<span class="trend-copy"><span class="trend-direction">Collecting trend</span></span></div>\n'
+                  )
+                  card = card[:close_index] + trend_html + card[close_index:]
+                  text = text[:card_match.start()] + card + text[card_match.end():]
+                  changed = True
+
+              config_pattern = re.compile(
+                  r"(?ms)(const KPI_TREND_CONFIG = Object\.freeze\(\{\n)(.*?)(^\s*\}\);)"
+              )
+              config_match = config_pattern.search(text)
+              if not config_match:
+                  raise RuntimeError("Marine trend patch could not locate KPI_TREND_CONFIG.")
+              config_body = config_match.group(2)
+              if "elementId:'marineTrend'" not in config_body:
+                  lga_match = re.search(r"(?m)^(?P<indent>\s*)lgas:\{", config_body)
+                  if not lga_match:
+                      raise RuntimeError("Marine trend patch could not find the LGA trend config anchor.")
+                  insert_at = lga_match.start()
+                  indent = lga_match.group("indent")
+                  marine_config = (
+                      f"{indent}marine:{{elementId:'marineTrend',field:'marine',hours:24,label:'Marine warnings'}},\n"
+                  )
+                  config_body = config_body[:insert_at] + marine_config + config_body[insert_at:]
+                  text = text[:config_match.start(2)] + config_body + text[config_match.end(2):]
+                  changed = True
+
+              old_comment = "// fast-moving power and rail (1h), roads/LGAs (6h), and schools (24h)."
+              new_comment = "// fast-moving power and rail (1h), roads/LGAs (6h), and schools/marine (24h)."
+              if old_comment in text:
+                  text = text.replace(old_comment, new_comment, 1)
+                  changed = True
+
+              required = (
+                  INDEX_MARKER,
+                  'id="marineTrend"',
+                  "marine:{elementId:'marineTrend',field:'marine',hours:24,label:'Marine warnings'}",
+              )
+              for token in required:
+                  if token not in text:
+                      raise RuntimeError(f"Marine trend index validation failed: missing {token!r}.")
+              if text.count('id="marineTrend"') != 1:
+                  raise RuntimeError("Marine trend index validation failed: marineTrend must occur exactly once.")
+              return text, changed
+
+
+          def main() -> int:
+              if not REFRESH.exists() or not INDEX.exists():
+                  raise SystemExit("Marine trend patch requires refresh.py and index.html.")
+
+              refresh_original = REFRESH.read_text(encoding="utf-8")
+              index_original = INDEX.read_text(encoding="utf-8")
+              try:
+                  refresh_patched, refresh_changed = patch_refresh(refresh_original)
+                  index_patched, index_changed = patch_index(index_original)
+              except Exception as exc:
+                  raise SystemExit(f"Marine KPI trend patch aborted without writing files: {exc}") from exc
+
+              if refresh_changed:
+                  REFRESH.write_text(refresh_patched, encoding="utf-8")
+              if index_changed:
+                  INDEX.write_text(index_patched, encoding="utf-8")
+
+              if refresh_changed or index_changed:
+                  print("Marine KPI trend enabled: 24-hour warning-count history using the existing KPI trend renderer.")
+              else:
+                  print("Marine KPI trend is already enabled; no changes required.")
+              return 0
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PY
+
+          python /tmp/apply_marine_trend.py
+          python -m py_compile refresh.py
+
       - name: Refresh live feeds
         run: python refresh.py
 
@@ -2052,6 +2210,7 @@ jobs:
             python /tmp/apply_qldtraffic_filter.py
             python /tmp/apply_marine_kpi.py
             python /tmp/apply_msq_verified_source.py
+            python /tmp/apply_marine_trend.py
             python -m py_compile refresh.py
             python refresh.py
             python /tmp/apply_multi_lga.py
