@@ -31,7 +31,7 @@ try:
 except ImportError:  # pragma: no cover - Python 3.8 fallback
     ZoneInfo = None  # type: ignore[assignment]
 
-SCRIPT_VERSION = "2026-08-05-operational-change-trends-v4"
+SCRIPT_VERSION = "2026-08-10-qldtraffic-hazards-flooding-v5"
 
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "index.html"
@@ -399,20 +399,51 @@ def fetch_lgas() -> dict[str, Any]:
     return {"type": "FeatureCollection", "features": features}
 
 
+QLDTRAFFIC_ALLOWED_EVENT_TYPES = {"hazard", "hazards", "flooding"}
+
+
+def qldtraffic_access_subtype(impact: dict[str, Any]) -> str | None:
+    """Classify only closures and access restrictions from QLDTraffic.
+
+    QLDTraffic uses a range of restriction labels, including vehicle-class and
+    load-limit wording, so do not rely only on the literal word ``restriction``.
+    """
+    combined = norm(f"{impact.get('impact_type')} {impact.get('impact_subtype')}")
+    if re.search(r"\b(?:closure|closed)\b", combined):
+        return "closure"
+    if (
+        re.search(r"\b(?:restriction|restricted)\b", combined)
+        or "high clearance" in combined
+        or "four wheel drive" in combined
+        or re.search(r"\b4wd\b", combined)
+        or "load limit" in combined
+        or re.search(r"\bgvm\b", combined)
+        or "axle group" in combined
+        or re.search(r"\blane\b", combined)
+    ):
+        return "restriction"
+    return None
+
+
 def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str, Any]]:
     incidents = []
     for feature in payload.get("features", []):
         props = feature.get("properties") or {}
         if norm(props.get("status")) not in {"", "active", "published"}:
             continue
-        impact = props.get("impact") or {}
-        combined = norm(f"{impact.get('impact_type')} {impact.get('impact_subtype')}")
-        if "closure" in combined or "closed" in combined:
-            subtype = "closure"
-        elif "lane" in combined or "restriction" in combined:
-            subtype = "restriction"
-        else:
+
+        # Match the QLDTraffic map filter requested for the dashboard:
+        # Current alerts -> Hazards + Flooding only. Crashes, congestion,
+        # roadworks and special events are deliberately excluded.
+        event_type = norm(props.get("event_type"))
+        if event_type not in QLDTRAFFIC_ALLOWED_EVENT_TYPES:
             continue
+
+        impact = props.get("impact") or {}
+        subtype = qldtraffic_access_subtype(impact)
+        if subtype is None:
+            continue
+
         duration = props.get("duration") or {}
         if not active_now(duration.get("start"), duration.get("end")):
             continue
@@ -434,7 +465,7 @@ def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str,
             "coordinates": coords,
             "geometry": geometry,
             "customers": 0,
-            "planned": norm(props.get("event_type")) == "roadworks",
+            "planned": False,
             "updated": iso(props.get("last_updated")) or NOW_ISO,
             "source_name": "QLDTraffic",
             "source_url": OFFICIAL_SOURCE_URLS["qldtraffic"],
