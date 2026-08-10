@@ -13,6 +13,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import html
+from html.parser import HTMLParser
 import http.cookiejar
 import json
 import re
@@ -52,6 +53,10 @@ SOURCES = {
     "rail": {
         "name": "Translink train disruptions",
         "url": "https://translink.com.au/service-updates/rss/train",
+    },
+    "marine": {
+        "name": "Maritime Safety Queensland",
+        "url": "https://qldmaritime.msq.qld.gov.au/",
     },
     "geography": {
         "name": "Queensland LGA boundaries",
@@ -333,6 +338,7 @@ def fetch_lgas() -> dict[str, Any]:
     if not features:
         raise RuntimeError("LGA service returned no features")
     return {"type": "FeatureCollection", "features": features}
+
 
 
 
@@ -707,6 +713,208 @@ def parse_rail(xml_data: bytes) -> list[dict[str, Any]]:
     return incidents
 
 
+
+# Marine Warnings KPI: Maritime Safety Queensland v1
+MSQ_NO_WARNING_PHRASES = (
+    "no current maritime warnings",
+    "no active maritime warnings",
+    "there are no current maritime warnings",
+    "there are no active maritime warnings",
+    "no current marine warnings",
+    "no active marine warnings",
+    "there are no current marine warnings",
+    "there are no active marine warnings",
+)
+
+MSQ_GENERIC_WARNING_LABELS = {
+    "marine warning",
+    "marine warnings",
+    "maritime warning",
+    "maritime warnings",
+    "warnings",
+    "current warnings",
+    "maritime safety queensland",
+    "opt in notifications",
+}
+
+
+class _MSQVisibleTextParser(HTMLParser):
+    """Extract visible text lines without executing dashboard JavaScript."""
+
+    _BREAK_TAGS = {
+        "address", "article", "aside", "br", "dd", "div", "dl", "dt",
+        "figcaption", "footer", "h1", "h2", "h3", "h4", "h5", "h6",
+        "header", "li", "main", "nav", "p", "section", "table", "td",
+        "th", "tr", "ul",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._skip_depth += 1
+            return
+        if not self._skip_depth and tag in self._BREAK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if not self._skip_depth and tag in self._BREAK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth:
+            self.parts.append(data)
+
+    def lines(self) -> list[str]:
+        return [clean(line) for line in "".join(self.parts).splitlines() if clean(line)]
+
+
+def _msq_warning_candidate(value: Any) -> str | None:
+    text = clean(html.unescape(str(value or "")))
+    if len(text) < 12 or len(text) > 500:
+        return None
+
+    key = norm(text)
+    if not key or key in MSQ_GENERIC_WARNING_LABELS:
+        return None
+    if key.startswith("opt in notification") or key in {"sign in", "register"}:
+        return None
+
+    # Strong phrases that identify an operational maritime warning rather than
+    # a navigation label or general preparedness link on the dashboard shell.
+    strong_phrases = (
+        "port closed",
+        "port closure",
+        "pilotage area closed",
+        "waterway closed",
+        "closed to vessel traffic",
+        "closed to all vessel traffic",
+        "navigation warning",
+        "hazard to navigation",
+        "marine warning in place",
+        "marine warnings in place",
+        "maritime warning in place",
+        "maritime warnings in place",
+        "extreme weather warning",
+        "red alert",
+        "orange alert",
+        "yellow alert",
+        "white alert",
+    )
+    if any(phrase in key for phrase in strong_phrases):
+        return text
+
+    # Also accept a descriptive warning sentence when it contains both a
+    # maritime subject and an active/impact qualifier.
+    maritime_terms = (
+        "port", "pilotage", "waterway", "navigation", "harbour", "harbor",
+        "vessel", "marine", "maritime", "cyclone", "storm", "swell", "flood",
+    )
+    active_terms = (
+        "active", "current", "closed", "closure", "hazard", "danger",
+        "alert", "issued", "effective", "restricted", "restriction",
+    )
+    if "warning" in key and any(term in key for term in maritime_terms) and any(term in key for term in active_terms):
+        return text
+
+    return None
+
+
+def _msq_unique_candidates(values: list[str]) -> list[str]:
+    candidates = []
+    for value in values:
+        candidate = _msq_warning_candidate(value)
+        if candidate:
+            candidates.append(candidate)
+
+    # Prefer concise card/title text when a longer captured block contains the
+    # same warning. This avoids counting one dashboard card multiple times.
+    unique: list[tuple[str, str]] = []
+    for candidate in sorted(candidates, key=lambda item: (len(item), item.lower())):
+        key = norm(candidate)
+        if any(key == existing or (len(key) >= 24 and (key in existing or existing in key)) for existing, _ in unique):
+            continue
+        unique.append((key, candidate))
+
+    if len(unique) > 40:
+        raise RuntimeError(
+            "MSQ dashboard warning extraction was ambiguous (more than 40 candidate blocks); "
+            "refusing to publish a potentially misleading KPI."
+        )
+    return [candidate for _, candidate in unique]
+
+
+def parse_msq_marine_warnings(html_data: bytes) -> list[dict[str, Any]]:
+    """Parse active warnings from the public MSQ dashboard, failing closed.
+
+    A verified explicit no-warning message is the only condition that produces
+    a trustworthy zero. If the server returns only the JavaScript application
+    shell, raise so source health reports the feed as unavailable rather than 0.
+    """
+    raw = html_data.decode("utf-8-sig", errors="replace")
+    if not clean(raw):
+        raise RuntimeError("MSQ dashboard returned an empty response")
+
+    parser = _MSQVisibleTextParser()
+    parser.feed(raw)
+    visible_lines = parser.lines()
+    visible_key = norm(" ".join(visible_lines))
+
+    if any(phrase in visible_key for phrase in MSQ_NO_WARNING_PHRASES):
+        return []
+
+    # Some Guardian/QIT dashboard deployments place public card payloads in
+    # script/JSON strings even when the main page is client-rendered. Inspect
+    # string values as a secondary path, without executing any JavaScript.
+    script_strings = []
+    for match in re.finditer(r"[\"']([^\"'\r\n]{12,500})[\"']", raw):
+        value = match.group(1)
+        if "warning" in value.lower() or "alert" in value.lower() or "closed" in value.lower():
+            script_strings.append(value.replace(r"\u0026", "&").replace(r"\/", "/"))
+
+    warnings = _msq_unique_candidates(visible_lines + script_strings)
+    if not warnings:
+        shell_key = norm(raw)
+        if "maritime safety queensland" in shell_key or "powered by qit plus" in shell_key:
+            raise RuntimeError(
+                "MSQ dashboard returned its application shell, but the active maritime-warning state "
+                "was not present in the server response"
+            )
+        raise RuntimeError("Unable to verify the active maritime-warning state from the MSQ dashboard")
+
+    incidents = []
+    for warning in warnings:
+        title = warning if len(warning) <= 170 else warning[:167].rstrip() + "…"
+        description = "" if title == warning else warning
+        incidents.append({
+            "id": f"marine-{stable_id(warning)}",
+            "sector": "marine",
+            "subtype": "warning",
+            "event_category": "maritime warning",
+            "title": title,
+            "description": description,
+            "status": "Active maritime warning",
+            "lga": None,
+            "locality": "Queensland maritime network",
+            "coordinates": None,
+            "geometry": None,
+            "customers": 0,
+            "planned": False,
+            "updated": NOW_ISO,
+            "source_name": "Maritime Safety Queensland",
+            "source_url": SOURCES["marine"]["url"],
+        })
+    return incidents
+
+
 def read_embedded() -> dict[str, Any]:
     text = INDEX.read_text(encoding="utf-8")
     start, end = text.index(DATA_START) + len(DATA_START), text.index(DATA_END)
@@ -763,6 +971,7 @@ def main() -> int:
         ("ergon", lambda: parse_power(get_json(SOURCES["ergon"]["url"], POWER_ARCGIS_PARAMS), "Ergon Energy", "ergon", lgas)),
         ("schools", lambda: parse_schools(get_bytes(SOURCES["schools"]["url"]).decode("utf-8-sig"), lgas)),
         ("rail", lambda: parse_rail(get_bytes(SOURCES["rail"]["url"]))),
+        ("marine", lambda: parse_msq_marine_warnings(get_bytes(SOURCES["marine"]["url"]))),
     ]
 
     for key, job in jobs:
