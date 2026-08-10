@@ -348,6 +348,7 @@ def fetch_lgas() -> dict[str, Any]:
 
 
 
+
 # QLDTraffic filter: Hazard + Flooding only
 # Queensland-only road geography filter
 QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
@@ -858,6 +859,83 @@ def source_result(name: str, status: str, count: int, error: str | None = None) 
     }
 
 
+# KPI trend history v2 (includes Marine)
+HISTORY_RETENTION = timedelta(days=7)
+HISTORY_MIN_SPACING = timedelta(minutes=10)
+HISTORY_MAX_POINTS = 700
+
+
+def _kpi_history_incident_lgas(incident: dict[str, Any], official_names: set[str]) -> set[str]:
+    """Return official Queensland LGA labels represented by one incident."""
+    aliases = {"Moreton Bay Regional": "City of Moreton Bay"}
+    names: set[str] = set()
+    raw = clean(incident.get("lga"))
+    if not raw:
+        return names
+    for part in re.split(r"\s*/\s*|\s*;\s*", raw):
+        name = aliases.get(clean(part), clean(part))
+        if name and (not official_names or name in official_names):
+            names.add(name)
+    return names
+
+
+def calculate_kpi_snapshot(incidents: list[dict[str, Any]], lgas: dict[str, Any], at: str) -> dict[str, Any]:
+    """Create compact statewide values used by the KPI trend visuals."""
+    roads = [item for item in incidents if item.get("sector") == "roads"]
+    power = [item for item in incidents if item.get("sector") == "power"]
+    rail = [item for item in incidents if item.get("sector") == "rail"]
+    schools = [item for item in incidents if item.get("sector") == "schools"]
+    marine = [item for item in incidents if item.get("sector") == "marine"]
+    official_names = {
+        clean(feature.get("properties", {}).get("display_name"))
+        for feature in lgas.get("features", [])
+        if clean(feature.get("properties", {}).get("display_name"))
+    }
+    affected_lgas: set[str] = set()
+    for incident in incidents:
+        affected_lgas.update(_kpi_history_incident_lgas(incident, official_names))
+    return {
+        "at": at,
+        "roads": len(roads),
+        "power_customers": sum(int(item.get("customers") or 0) for item in power),
+        "power_outages": len(power),
+        "rail": len(rail),
+        "schools": len(schools),
+        "marine": len(marine),
+        "lgas": len(affected_lgas),
+    }
+
+
+def update_kpi_history(previous: dict[str, Any], incidents: list[dict[str, Any]], lgas: dict[str, Any]) -> list[dict[str, Any]]:
+    """Preserve, append and prune KPI history across scheduled refreshes."""
+    history = [
+        item for item in previous.get("history", [])
+        if isinstance(item, dict) and item.get("at")
+    ]
+    if not history and previous.get("generated_at"):
+        history.append(
+            calculate_kpi_snapshot(
+                previous.get("incidents", []),
+                lgas,
+                clean(previous.get("generated_at")),
+            )
+        )
+
+    current = calculate_kpi_snapshot(incidents, lgas, NOW_ISO)
+    last_at = parse_date(history[-1].get("at")) if history else None
+    if last_at and NOW - last_at < HISTORY_MIN_SPACING:
+        history[-1] = current
+    else:
+        history.append(current)
+
+    cutoff = NOW - HISTORY_RETENTION
+    retained: list[dict[str, Any]] = []
+    for item in history:
+        item_at = parse_date(item.get("at"))
+        if item_at and item_at >= cutoff:
+            retained.append(item)
+    return retained[-HISTORY_MAX_POINTS:]
+
 def main() -> int:
     if not INDEX.exists():
         print("index.html was not found beside refresh.py", file=sys.stderr)
@@ -913,10 +991,13 @@ def main() -> int:
             sources[key] = source_result(key, "fallback" if fallback else "error", len(fallback), str(exc))
             print(f"{SOURCES[key]['name']}: ERROR - {exc}")
 
+    history = update_kpi_history(previous, incidents, lgas)
+
     data = {
         "generated_at": NOW_ISO,
         "notice": "Snapshot refreshed automatically by GitHub. Scheduled runs occur every 15 minutes; individual source publication times may differ.",
         "incidents": incidents,
+        "history": history,
         "lgas": lgas,
         "sources": sources,
     }
