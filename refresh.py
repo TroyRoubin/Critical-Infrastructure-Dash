@@ -344,6 +344,7 @@ def fetch_lgas() -> dict[str, Any]:
 
 
 
+
 # QLDTraffic filter: Hazard + Flooding only
 # Queensland-only road geography filter
 QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
@@ -716,431 +717,104 @@ def parse_rail(xml_data: bytes) -> list[dict[str, Any]]:
 
 
 
+
 # Marine Warnings KPI: Maritime Safety Queensland v1
-MSQ_NO_WARNING_PHRASES = (
-    "no current maritime warnings",
-    "no active maritime warnings",
-    "there are no current maritime warnings",
-    "there are no active maritime warnings",
-    "no current marine warnings",
-    "no active marine warnings",
-    "there are no current marine warnings",
-    "there are no active marine warnings",
-)
+# Marine verified rendered-dashboard source v6
+# The workflow renders the Guardian dashboard in Chromium and writes only visible,
+# area-specific current warning cards to /tmp/msq-current-warnings.json.
+MSQ_BROWSER_SNAPSHOT = Path("/tmp/msq-current-warnings.json")
 
-MSQ_GENERIC_WARNING_LABELS = {
-    "marine warning",
-    "marine warnings",
-    "maritime warning",
-    "maritime warnings",
-    "warnings",
-    "current warnings",
-    "maritime safety queensland",
-    "opt in notifications",
-}
-
-
-class _MSQVisibleTextParser(HTMLParser):
-    """Extract visible text lines without executing dashboard JavaScript."""
-
-    _BREAK_TAGS = {
-        "address", "article", "aside", "br", "dd", "div", "dl", "dt",
-        "figcaption", "footer", "h1", "h2", "h3", "h4", "h5", "h6",
-        "header", "li", "main", "nav", "p", "section", "table", "td",
-        "th", "tr", "ul",
-    }
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        self._skip_depth = 0
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        tag = tag.lower()
-        if tag in {"script", "style"}:
-            self._skip_depth += 1
-            return
-        if not self._skip_depth and tag in self._BREAK_TAGS:
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        tag = tag.lower()
-        if tag in {"script", "style"}:
-            self._skip_depth = max(0, self._skip_depth - 1)
-            return
-        if not self._skip_depth and tag in self._BREAK_TAGS:
-            self.parts.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        if not self._skip_depth:
-            self.parts.append(data)
-
-    def lines(self) -> list[str]:
-        return [clean(line) for line in "".join(self.parts).splitlines() if clean(line)]
-
-
-def _msq_warning_candidate(value: Any) -> str | None:
-    text = clean(html.unescape(str(value or "")))
-    if len(text) < 12 or len(text) > 500:
-        return None
-
-    key = norm(text)
-    if not key or key in MSQ_GENERIC_WARNING_LABELS:
-        return None
-    if key.startswith("opt in notification") or key in {"sign in", "register"}:
-        return None
-
-    # Strong phrases that identify an operational maritime warning rather than
-    # a navigation label or general preparedness link on the dashboard shell.
-    strong_phrases = (
-        "port closed",
-        "port closure",
-        "pilotage area closed",
-        "waterway closed",
-        "closed to vessel traffic",
-        "closed to all vessel traffic",
-        "navigation warning",
-        "hazard to navigation",
-        "marine warning in place",
-        "marine warnings in place",
-        "maritime warning in place",
-        "maritime warnings in place",
-        "extreme weather warning",
-        "red alert",
-        "orange alert",
-        "yellow alert",
-        "white alert",
-    )
-    if any(phrase in key for phrase in strong_phrases):
-        return text
-
-    # Also accept a descriptive warning sentence when it contains both a
-    # maritime subject and an active/impact qualifier.
-    maritime_terms = (
-        "port", "pilotage", "waterway", "navigation", "harbour", "harbor",
-        "vessel", "marine", "maritime", "cyclone", "storm", "swell", "flood",
-    )
-    active_terms = (
-        "active", "current", "closed", "closure", "hazard", "danger",
-        "alert", "issued", "effective", "restricted", "restriction",
-    )
-    if "warning" in key and any(term in key for term in maritime_terms) and any(term in key for term in active_terms):
-        return text
-
-    return None
-
-
-def _msq_unique_candidates(values: list[str]) -> list[str]:
-    candidates = []
-    for value in values:
-        candidate = _msq_warning_candidate(value)
-        if candidate:
-            candidates.append(candidate)
-
-    # Prefer concise card/title text when a longer captured block contains the
-    # same warning. This avoids counting one dashboard card multiple times.
-    unique: list[tuple[str, str]] = []
-    for candidate in sorted(candidates, key=lambda item: (len(item), item.lower())):
-        key = norm(candidate)
-        if any(key == existing or (len(key) >= 24 and (key in existing or existing in key)) for existing, _ in unique):
-            continue
-        unique.append((key, candidate))
-
-    if len(unique) > 40:
-        raise RuntimeError(
-            "MSQ dashboard warning extraction was ambiguous (more than 40 candidate blocks); "
-            "refusing to publish a potentially misleading KPI."
-        )
-    return [candidate for _, candidate in unique]
-
-
-
-
-# Marine map locations v4
-# Coordinate order throughout the dashboard is GeoJSON order: [longitude, latitude].
-MSQ_QLD_BOUNDS = {
-    "min_lon": 137.8,
-    "max_lon": 154.2,
-    "min_lat": -29.3,
-    "max_lat": -9.0,
-}
-
-# Representative positions for Queensland maritime areas commonly used by MSQ.
-# Explicit coordinates in the source warning always take precedence over these.
+MSQ_QLD_BOUNDS = {"min_lon": 137.8, "max_lon": 154.2, "min_lat": -29.3, "max_lat": -9.0}
 MSQ_LOCATION_POINTS = (
-    (("mooloolah river", "mooloolaba"), "Mooloolaba / Mooloolah River", [153.126, -26.681]),
-    (("pumicestone passage", "golden beach", "bribie island"), "Pumicestone Passage", [153.112, -27.005]),
-    (("maroochy river", "maroochydore"), "Maroochy River", [153.089, -26.650]),
-    (("caboolture river",), "Caboolture River", [153.067, -27.133]),
-    (("redland bay", "weinam"), "Redland Bay", [153.302, -27.612]),
-    (("cape moreton", "moreton island"), "Cape Moreton", [153.466, -27.031]),
-    (("moreton bay",), "Moreton Bay", [153.250, -27.200]),
-    (("port of brisbane", "brisbane pilotage", "brisbane port"), "Port of Brisbane", [153.170, -27.380]),
-    (("southport", "gold coast seaway", "gold coast"), "Southport / Gold Coast", [153.431, -27.967]),
-    (("noosa",), "Noosa", [153.102, -26.382]),
+    (("rockhampton", "fitzroy river"), "Rockhampton / Fitzroy River", [150.510, -23.380]),
+    (("port alma",), "Port Alma", [150.860, -23.590]),
+    (("gladstone", "port curtis"), "Gladstone", [151.250, -23.840]),
+    (("bundaberg", "burnett river"), "Bundaberg / Burnett River", [152.390, -24.760]),
     (("hervey bay",), "Hervey Bay", [152.900, -25.280]),
-    (("wide bay",), "Wide Bay", [152.780, -25.820]),
-    (("bundaberg", "burnett river"), "Bundaberg", [152.390, -24.760]),
-    (("capricorn coast", "keppel bay", "yeppoon"), "Capricorn Coast / Keppel Bay", [150.820, -23.150]),
-    (("port alma", "rockhampton"), "Rockhampton / Port Alma", [150.860, -23.590]),
-    (("gladstone",), "Gladstone", [151.250, -23.840]),
-    (("mackay",), "Mackay", [149.230, -21.120]),
-    (("hay point",), "Hay Point", [149.300, -21.290]),
-    (("whitsunday", "airlie beach"), "Whitsundays", [148.720, -20.270]),
-    (("bowen",), "Bowen", [148.250, -20.010]),
-    (("abbot point",), "Abbot Point", [148.084, -19.878]),
-    (("townsville",), "Townsville", [146.830, -19.250]),
-    (("lucinda", "hinchinbrook"), "Lucinda / Hinchinbrook", [146.330, -18.530]),
-    (("mourilyan",), "Mourilyan", [146.120, -17.600]),
-    (("cairns",), "Cairns", [145.780, -16.920]),
-    (("port douglas",), "Port Douglas", [145.460, -16.480]),
-    (("daintree river", "daintree"), "Daintree River", [145.460, -16.290]),
-    (("cooktown",), "Cooktown", [145.250, -15.460]),
-    (("cape flattery",), "Cape Flattery", [145.310, -14.960]),
-    (("weipa",), "Weipa", [141.870, -12.680]),
-    (("amrun",), "Amrun", [141.650, -12.900]),
-    (("skardon river",), "Skardon River", [142.050, -11.790]),
+    (("wide bay", "tin can bay"), "Wide Bay", [152.780, -25.820]),
+    (("mooloolah river", "mooloolaba"), "Mooloolaba / Mooloolah River", [153.126, -26.681]),
+    (("maroochy river", "maroochydore"), "Maroochy River", [153.089, -26.650]),
+    (("noosa",), "Noosa", [153.102, -26.382]),
+    (("pumicestone passage", "golden beach", "bribie island"), "Pumicestone Passage", [153.112, -27.005]),
+    (("moreton bay", "cape moreton", "moreton island"), "Moreton Bay", [153.250, -27.200]),
+    (("port of brisbane", "brisbane pilotage", "brisbane port"), "Port of Brisbane", [153.170, -27.380]),
+    (("redland bay", "weinam creek", "weinam"), "Redland Bay", [153.302, -27.612]),
+    (("southport", "gold coast seaway", "gold coast"), "Southport / Gold Coast", [153.431, -27.967]),
+    (("mackay",), "Mackay", [149.230, -21.120]), (("hay point",), "Hay Point", [149.300, -21.290]),
+    (("whitsunday", "airlie beach"), "Whitsundays", [148.720, -20.270]), (("bowen",), "Bowen", [148.250, -20.010]),
+    (("abbot point",), "Abbot Point", [148.084, -19.878]), (("townsville",), "Townsville", [146.830, -19.250]),
+    (("lucinda", "hinchinbrook"), "Lucinda / Hinchinbrook", [146.330, -18.530]), (("mourilyan",), "Mourilyan", [146.120, -17.600]),
+    (("cairns",), "Cairns", [145.780, -16.920]), (("port douglas",), "Port Douglas", [145.460, -16.480]),
+    (("daintree river",), "Daintree River", [145.460, -16.290]), (("cooktown",), "Cooktown", [145.250, -15.460]),
+    (("cape flattery",), "Cape Flattery", [145.310, -14.960]), (("weipa",), "Weipa", [141.870, -12.680]),
+    (("amrun",), "Amrun", [141.650, -12.900]), (("skardon river",), "Skardon River", [142.050, -11.790]),
     (("thursday island", "torres strait"), "Thursday Island / Torres Strait", [142.220, -10.580]),
-    (("karumba",), "Karumba", [140.830, -17.490]),
-    (("gulf of carpentaria",), "Gulf of Carpentaria", [140.900, -16.500]),
-    (("far north queensland", "far north qld"), "Far North Queensland coast", [145.700, -16.900]),
-    (("north queensland", "north qld"), "North Queensland coast", [146.800, -19.300]),
-    (("central queensland", "central qld"), "Central Queensland coast", [150.900, -23.300]),
-    (("south east queensland", "south-east queensland", "southeast queensland", "south east qld"), "South East Queensland coast", [153.250, -27.300]),
+    (("karumba",), "Karumba", [140.830, -17.490]), (("gulf of carpentaria",), "Gulf of Carpentaria", [140.900, -16.500]),
 )
-
-MSQ_STATEWIDE_POINT = [151.000, -21.000]
 
 def _msq_point_in_qld(point: list[float] | None) -> bool:
-    if not point or len(point) < 2:
-        return False
-    lon, lat = float(point[0]), float(point[1])
-    return (
-        MSQ_QLD_BOUNDS["min_lon"] <= lon <= MSQ_QLD_BOUNDS["max_lon"]
-        and MSQ_QLD_BOUNDS["min_lat"] <= lat <= MSQ_QLD_BOUNDS["max_lat"]
-    )
-
-def _msq_explicit_decimal_point(value: str) -> list[float] | None:
-    values = [float(match.group(0)) for match in re.finditer(
-        r"(?<![A-Za-z0-9.])[-+]?\d{1,3}\.\d{3,}(?![A-Za-z0-9.])", value
-    )]
-    for first, second in zip(values, values[1:]):
-        for point in ([first, second], [second, first]):
-            if _msq_point_in_qld(point):
-                return [round(float(point[0]), 6), round(float(point[1]), 6)]
-    return None
-
-def _msq_explicit_dms_point(value: str) -> list[float] | None:
-    component_re = re.compile(
-        r"(?P<deg>\d{1,3})\s*[°º]\s*"
-        r"(?P<min>\d{1,2}(?:\.\d+)?)?\s*['′’]?\s*"
-        r"(?P<sec>\d{1,2}(?:\.\d+)?)?\s*[\"″”]?\s*"
-        r"(?P<hem>[NSEW])",
-        re.I,
-    )
-    components: list[tuple[str, float]] = []
-    for match in component_re.finditer(value):
-        degrees = float(match.group("deg"))
-        minutes = float(match.group("min") or 0)
-        seconds = float(match.group("sec") or 0)
-        decimal = degrees + minutes / 60.0 + seconds / 3600.0
-        hemisphere = match.group("hem").upper()
-        if hemisphere in {"S", "W"}:
-            decimal *= -1
-        components.append((hemisphere, decimal))
-    for index, (hemisphere, decimal) in enumerate(components):
-        if hemisphere not in {"N", "S"}:
-            continue
-        for other_hemisphere, other_decimal in components[index + 1:index + 4]:
-            if other_hemisphere in {"E", "W"}:
-                point = [other_decimal, decimal]
-                if _msq_point_in_qld(point):
-                    return [round(point[0], 6), round(point[1], 6)]
-    return None
+    if not point or len(point) < 2: return False
+    try: lon, lat = float(point[0]), float(point[1])
+    except (TypeError, ValueError): return False
+    return MSQ_QLD_BOUNDS["min_lon"] <= lon <= MSQ_QLD_BOUNDS["max_lon"] and MSQ_QLD_BOUNDS["min_lat"] <= lat <= MSQ_QLD_BOUNDS["max_lat"]
 
 def _msq_location_from_lga(value: str, lgas: dict[str, Any]) -> tuple[list[float] | None, str | None]:
-    warning_key = norm(value)
-    best: tuple[int, list[float], str] | None = None
+    warning_key = norm(value); best: tuple[int, list[float], str] | None = None
     for feature in lgas.get("features", []):
-        props = feature.get("properties") or {}
-        candidate_names: list[str] = []
+        props = feature.get("properties") or {}; names: list[str] = []
         for prop_key, prop_value in props.items():
-            key = str(prop_key).lower()
-            if prop_value and ("lga" in key or "name" in key or "local_government" in key):
+            field = str(prop_key).lower()
+            if prop_value and ("lga" in field or "name" in field or "local_government" in field):
                 name = clean(prop_value)
-                if name:
-                    candidate_names.append(name)
-        for name in candidate_names:
+                if name: names.append(name)
+        for name in names:
             name_key = norm(name)
-            if len(name_key) < 4 or name_key not in warning_key:
-                continue
+            if len(name_key) < 4 or name_key not in warning_key: continue
             point = representative_point(feature.get("geometry"))
             if point and _msq_point_in_qld(point):
                 score = len(name_key)
-                if best is None or score > best[0]:
-                    best = (score, point, name)
-    if best:
-        return [round(float(best[1][0]), 6), round(float(best[1][1]), 6)], best[2]
+                if best is None or score > best[0]: best = (score, point, name)
+    if best: return [round(float(best[1][0]), 6), round(float(best[1][1]), 6)], best[2]
     return None, None
 
-def _msq_warning_location(value: str, lgas: dict[str, Any]) -> tuple[list[float], str, str | None, str]:
-    point = _msq_explicit_dms_point(value) or _msq_explicit_decimal_point(value)
-    if point:
-        return point, "MSQ warning coordinates", locate_lga(point, lgas) if lgas.get("features") else None, "exact"
+def _msq_warning_location(value: str, lgas: dict[str, Any]) -> tuple[list[float] | None, str, str | None, str]:
     warning_key = norm(value)
     for aliases, locality, point in MSQ_LOCATION_POINTS:
         if any(norm(alias) in warning_key for alias in aliases):
-            return list(point), locality, locate_lga(point, lgas) if lgas.get("features") else None, "representative"
+            lga = locate_lga(point, lgas) if lgas.get("features") else None
+            return list(point), locality, lga, "representative"
     point, lga = _msq_location_from_lga(value, lgas)
-    if point:
-        return point, lga or "Queensland LGA", lga, "lga"
-    return list(MSQ_STATEWIDE_POINT), "Queensland maritime network (source location not specified)", None, "statewide"
+    if point: return point, lga or clean(value), lga, "lga"
+    return None, clean(value) or "Area identified by MSQ", None, "unmapped"
 
-def _msq_warning_parts(value: str) -> tuple[str | None, str | None, str | None]:
-    # Extract alert phase, warning level and operational direction from an MSQ title.
-    title = clean(value)
-    parts = [clean(part) for part in re.split(r"\s+(?:-|–|—)\s+", title) if clean(part)]
-    if not parts:
-        return None, None, None
+def _msq_snapshot() -> dict[str, Any]:
+    if not MSQ_BROWSER_SNAPSHOT.exists(): raise RuntimeError("verified MSQ browser snapshot was not created by the workflow")
+    try: payload = json.loads(MSQ_BROWSER_SNAPSHOT.read_text(encoding="utf-8"))
+    except Exception as exc: raise RuntimeError(f"verified MSQ browser snapshot is unreadable: {exc}") from exc
+    if payload.get("schema") != "msq-rendered-current-v1": raise RuntimeError("verified MSQ browser snapshot has an unexpected schema")
+    if payload.get("status") != "current": raise RuntimeError(clean(payload.get("error")) or "MSQ rendered dashboard could not be verified")
+    warnings = payload.get("warnings")
+    if not isinstance(warnings, list): raise RuntimeError("verified MSQ browser snapshot does not contain a warning list")
+    if not warnings and not bool(payload.get("verified_zero")): raise RuntimeError("MSQ snapshot contains zero records without an explicit verified no-warning state")
+    return payload
 
-    alert_phase = next((part for part in parts if "alert" in norm(part)), None)
-    warning_level = next((
-        part for part in parts
-        if any(term in norm(part) for term in ("emergency warning", "watch and act", "advice", "warning"))
-        and part != alert_phase
-    ), None)
-    action = next((part for part in reversed(parts) if part not in {alert_phase, warning_level}), None)
-    return alert_phase, warning_level, action
-
-
-def _msq_warning_detail(title: str, values: list[str]) -> str:
-    # Keep a richer source string when the dashboard exposes one for the same warning.
-    title_text = clean(title)
-    title_key = norm(title_text)
-    if not title_key:
-        return ""
-
-    best = ""
-    for value in values:
-        candidate = clean(html.unescape(str(value or "")))
-        candidate = clean(
-            candidate.replace(r"\n", " ")
-            .replace(r"\r", " ")
-            .replace(r"\t", " ")
-            .replace(r'\"', '"')
-        )
-        candidate_key = norm(candidate)
-        if not candidate_key or candidate_key == title_key:
-            continue
-        if title_key not in candidate_key:
-            continue
-        if len(candidate) <= len(title_text) + 8 or len(candidate) > 1200:
-            continue
-        if len(candidate) > len(best):
-            best = candidate
-
-    if not best:
-        return ""
-
-    # Avoid repeating the title when a dashboard payload is "title - details".
-    if best.lower().startswith(title_text.lower()):
-        remainder = clean(best[len(title_text):].lstrip(" -:|–—"))
-        if remainder:
-            best = remainder
-    return best[:1200]
-
-
-def msq_marine_fallback_records(records: list[dict[str, Any]], lgas: dict[str, Any]) -> list[dict[str, Any]]:
-    # Upgrade cached Marine records so fallback warnings retain rich display data and map cleanly.
-    enriched: list[dict[str, Any]] = []
-    for item in records:
-        record = dict(item)
-        if record.get("sector") != "marine":
-            enriched.append(record)
-            continue
-
-        warning_text = " ".join(
-            clean(record.get(field))
-            for field in ("title", "description", "locality")
-            if clean(record.get(field))
-        )
-        alert_phase, warning_level, action = _msq_warning_parts(clean(record.get("title")))
-        record["marine_alert_phase"] = record.get("marine_alert_phase") or alert_phase
-        record["marine_warning_level"] = record.get("marine_warning_level") or warning_level
-        record["marine_action"] = record.get("marine_action") or action
-
-        if not _msq_point_in_qld(record.get("coordinates")):
-            coordinates, locality, lga, location_precision = _msq_warning_location(warning_text, lgas)
-            record["coordinates"] = coordinates
-            record["geometry"] = record.get("geometry") or None
-            record["location_precision"] = location_precision
-            if not clean(record.get("locality")) or norm(record.get("locality")) == "queensland maritime network":
-                record["locality"] = locality
-            if not clean(record.get("lga")) and lga:
-                record["lga"] = lga
-        else:
-            record["location_precision"] = record.get("location_precision") or "exact"
-        enriched.append(record)
-    return enriched
-
-
-def parse_msq_marine_warnings(html_data: bytes, lgas: dict[str, Any]) -> list[dict[str, Any]]:
-    # Parse active MSQ warnings, retain richer source text where exposed, and attach a map location.
-    raw = html_data.decode("utf-8-sig", errors="replace")
-    if not clean(raw):
-        raise RuntimeError("MSQ dashboard returned an empty response")
-    parser = _MSQVisibleTextParser()
-    parser.feed(raw)
-    visible_lines = parser.lines()
-    visible_key = norm(" ".join(visible_lines))
-    if any(phrase in visible_key for phrase in MSQ_NO_WARNING_PHRASES):
-        return []
-
-    script_strings = []
-    for match in re.finditer(r"[\"']([^\"'\r\n]{12,500})[\"']", raw):
-        value = match.group(1)
-        if "warning" in value.lower() or "alert" in value.lower() or "closed" in value.lower():
-            script_strings.append(value.replace(r"\u0026", "&").replace(r"\/", "/"))
-
-    source_values = visible_lines + script_strings
-    warnings = _msq_unique_candidates(source_values)
-    if not warnings:
-        shell_key = norm(raw)
-        if "maritime safety queensland" in shell_key or "powered by qit plus" in shell_key:
-            raise RuntimeError(
-                "MSQ dashboard returned its application shell, but the active maritime-warning state "
-                "was not present in the server response"
-            )
-        raise RuntimeError("Unable to verify the active maritime-warning state from the MSQ dashboard")
-
-    incidents = []
-    for warning in warnings:
-        title = warning if len(warning) <= 170 else warning[:167].rstrip() + "…"
-        source_detail = _msq_warning_detail(warning, source_values)
-        description = source_detail or ("" if title == warning else warning)
-        alert_phase, warning_level, action = _msq_warning_parts(warning)
-        coordinates, locality, lga, location_precision = _msq_warning_location(warning + " " + description, lgas)
+def parse_msq_marine_warnings(lgas: dict[str, Any]) -> list[dict[str, Any]]:
+    payload = _msq_snapshot(); incidents: list[dict[str, Any]] = []
+    for item in payload.get("warnings", []):
+        if not isinstance(item, dict): continue
+        title = clean(item.get("title")); area = clean(item.get("area")); description = clean(item.get("description"))
+        if not title or not area: raise RuntimeError("verified MSQ warning is missing its rendered title or area")
+        if clean(item.get("source_method")) != "rendered-visible-card": raise RuntimeError("MSQ warning was not sourced from a verified rendered warning card")
+        coordinates, locality, lga, location_precision = _msq_warning_location(" ".join(filter(None, (area, title, description))), lgas)
         incidents.append({
-            "id": f"marine-{stable_id(warning)}",
-            "sector": "marine",
-            "subtype": "warning",
-            "event_category": "maritime warning",
-            "title": title,
-            "description": description,
-            "status": "Active maritime warning",
-            "marine_alert_phase": alert_phase,
-            "marine_warning_level": warning_level,
-            "marine_action": action,
-            "lga": lga,
-            "locality": locality,
-            "coordinates": coordinates,
-            "geometry": None,
-            "location_precision": location_precision,
-            "customers": 0,
-            "planned": False,
-            "updated": NOW_ISO,
-            "source_name": "Maritime Safety Queensland",
-            "source_url": SOURCES["marine"]["url"],
+            "id": f"marine-{stable_id(area, title)}", "sector": "marine", "subtype": "warning", "event_category": "maritime warning",
+            "title": title[:220], "description": description[:3500], "status": clean(item.get("status")) or "Active maritime warning",
+            "marine_alert_phase": clean(item.get("alert_phase")) or None, "marine_warning_level": clean(item.get("warning_level")) or None,
+            "marine_action": clean(item.get("action")) or None, "marine_issued_text": clean(item.get("issued_text")) or None,
+            "lga": lga, "locality": locality, "coordinates": coordinates, "geometry": None, "location_precision": location_precision,
+            "customers": 0, "planned": False, "updated": clean(payload.get("captured_at")) or NOW_ISO,
+            "source_name": "Maritime Safety Queensland", "source_url": SOURCES["marine"]["url"],
+            "source_method": "msq-rendered-visible-current-warning",
         })
     return incidents
 
@@ -1201,7 +875,7 @@ def main() -> int:
         ("ergon", lambda: parse_power(get_json(SOURCES["ergon"]["url"], POWER_ARCGIS_PARAMS), "Ergon Energy", "ergon", lgas)),
         ("schools", lambda: parse_schools(get_bytes(SOURCES["schools"]["url"]).decode("utf-8-sig"), lgas)),
         ("rail", lambda: parse_rail(get_bytes(SOURCES["rail"]["url"]))),
-        ("marine", lambda: parse_msq_marine_warnings(get_bytes(SOURCES["marine"]["url"]), lgas)),
+        ("marine", lambda: parse_msq_marine_warnings(lgas)),
     ]
 
     for key, job in jobs:
@@ -1216,7 +890,7 @@ def main() -> int:
             fallback = (
                 qldtraffic_fallback_records(previous_by_source.get(key, []), lgas)
                 if key == "qldtraffic"
-                else msq_marine_fallback_records(previous_by_source.get(key, []), lgas)
+                else []
                 if key == "marine"
                 else previous_by_source.get(key, [])
             )
