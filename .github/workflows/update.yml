@@ -1468,7 +1468,12 @@ jobs:
           set -euo pipefail
           cat > /tmp/apply_marine_trend.py <<'PY'
           #!/usr/bin/env python3
-          """Add Marine warning count to the existing KPI trend/history system."""
+          """Install/upgrade KPI history and add the Marine warnings trend.
+
+          The live refresher restored by this workflow predates the KPI-history helpers,
+          so this patch installs the history mechanism when it is absent instead of
+          assuming calculate_kpi_snapshot() already exists.
+          """
           from __future__ import annotations
 
           from pathlib import Path
@@ -1476,56 +1481,186 @@ jobs:
 
           REFRESH = Path("refresh.py")
           INDEX = Path("index.html")
-          REFRESH_MARKER = "# Marine KPI trend history v1"
-          INDEX_MARKER = "<!-- Marine KPI trend v1 -->"
+          REFRESH_MARKER = "# KPI trend history v2 (includes Marine)"
+          INDEX_MARKER = "<!-- Marine KPI trend v2 -->"
+
+          HISTORY_BLOCK = r'''
+          # KPI trend history v2 (includes Marine)
+          HISTORY_RETENTION = timedelta(days=7)
+          HISTORY_MIN_SPACING = timedelta(minutes=10)
+          HISTORY_MAX_POINTS = 700
+
+
+          def _kpi_history_incident_lgas(incident: dict[str, Any], official_names: set[str]) -> set[str]:
+              """Return official Queensland LGA labels represented by one incident."""
+              aliases = {"Moreton Bay Regional": "City of Moreton Bay"}
+              names: set[str] = set()
+              raw = clean(incident.get("lga"))
+              if not raw:
+                  return names
+              for part in re.split(r"\s*/\s*|\s*;\s*", raw):
+                  name = aliases.get(clean(part), clean(part))
+                  if name and (not official_names or name in official_names):
+                      names.add(name)
+              return names
+
+
+          def calculate_kpi_snapshot(incidents: list[dict[str, Any]], lgas: dict[str, Any], at: str) -> dict[str, Any]:
+              """Create compact statewide values used by the KPI trend visuals."""
+              roads = [item for item in incidents if item.get("sector") == "roads"]
+              power = [item for item in incidents if item.get("sector") == "power"]
+              rail = [item for item in incidents if item.get("sector") == "rail"]
+              schools = [item for item in incidents if item.get("sector") == "schools"]
+              marine = [item for item in incidents if item.get("sector") == "marine"]
+              official_names = {
+                  clean(feature.get("properties", {}).get("display_name"))
+                  for feature in lgas.get("features", [])
+                  if clean(feature.get("properties", {}).get("display_name"))
+              }
+              affected_lgas: set[str] = set()
+              for incident in incidents:
+                  affected_lgas.update(_kpi_history_incident_lgas(incident, official_names))
+              return {
+                  "at": at,
+                  "roads": len(roads),
+                  "power_customers": sum(int(item.get("customers") or 0) for item in power),
+                  "power_outages": len(power),
+                  "rail": len(rail),
+                  "schools": len(schools),
+                  "marine": len(marine),
+                  "lgas": len(affected_lgas),
+              }
+
+
+          def update_kpi_history(previous: dict[str, Any], incidents: list[dict[str, Any]], lgas: dict[str, Any]) -> list[dict[str, Any]]:
+              """Preserve, append and prune KPI history across scheduled refreshes."""
+              history = [
+                  item for item in previous.get("history", [])
+                  if isinstance(item, dict) and item.get("at")
+              ]
+              if not history and previous.get("generated_at"):
+                  history.append(
+                      calculate_kpi_snapshot(
+                          previous.get("incidents", []),
+                          lgas,
+                          clean(previous.get("generated_at")),
+                      )
+                  )
+
+              current = calculate_kpi_snapshot(incidents, lgas, NOW_ISO)
+              last_at = parse_date(history[-1].get("at")) if history else None
+              if last_at and NOW - last_at < HISTORY_MIN_SPACING:
+                  history[-1] = current
+              else:
+                  history.append(current)
+
+              cutoff = NOW - HISTORY_RETENTION
+              retained: list[dict[str, Any]] = []
+              for item in history:
+                  item_at = parse_date(item.get("at"))
+                  if item_at and item_at >= cutoff:
+                      retained.append(item)
+              return retained[-HISTORY_MAX_POINTS:]
+          '''
+
+
+          def patch_existing_snapshot_function(text: str) -> tuple[str, bool]:
+              pattern = re.compile(
+                  r"(?ms)^def calculate_kpi_snapshot\([^\n]*\).*?(?=^def [A-Za-z_][A-Za-z0-9_]*\(|\Z)"
+              )
+              match = pattern.search(text)
+              if not match:
+                  return text, False
+              block = match.group(0)
+              changed = False
+
+              marine_list = '    marine = [item for item in incidents if item.get("sector") == "marine"]\n'
+              if marine_list not in block:
+                  anchor = '    schools = [item for item in incidents if item.get("sector") == "schools"]\n'
+                  if anchor not in block:
+                      raise RuntimeError("Existing KPI snapshot function has an unrecognised sector-list layout.")
+                  block = block.replace(anchor, anchor + marine_list, 1)
+                  changed = True
+
+              if '"marine": len(marine),' not in block:
+                  anchor_re = re.compile(r'(?m)^(?P<indent>\s*)"schools"\s*:\s*len\(schools\),\s*$')
+                  anchor_match = anchor_re.search(block)
+                  if not anchor_match:
+                      raise RuntimeError("Existing KPI snapshot function has no schools return field anchor.")
+                  insert_at = anchor_match.end()
+                  indent = anchor_match.group("indent")
+                  block = block[:insert_at] + f'\n{indent}"marine": len(marine),' + block[insert_at:]
+                  changed = True
+
+              return text[:match.start()] + block + text[match.end():], changed
 
 
           def patch_refresh(text: str) -> tuple[str, bool]:
               changed = False
-              function_pattern = re.compile(
-                  r"(?ms)^def calculate_kpi_snapshot\([^\n]*\).*?(?=^def [A-Za-z_][A-Za-z0-9_]*\(|\Z)"
+              has_snapshot = "def calculate_kpi_snapshot(" in text
+              has_update = "def update_kpi_history(" in text
+
+              if not has_snapshot and not has_update:
+                  main_anchor = "\ndef main() -> int:\n"
+                  if main_anchor not in text:
+                      raise RuntimeError("Marine trend patch could not locate main() in refresh.py.")
+                  text = text.replace(
+                      main_anchor,
+                      "\n" + HISTORY_BLOCK.strip("\n") + "\n\n" + main_anchor.lstrip("\n"),
+                      1,
+                  )
+                  changed = True
+              elif has_snapshot and has_update:
+                  text, upgraded = patch_existing_snapshot_function(text)
+                  changed = changed or upgraded
+                  if REFRESH_MARKER not in text:
+                      marker_pos = text.index("def calculate_kpi_snapshot(")
+                      text = text[:marker_pos] + REFRESH_MARKER + "\n" + text[marker_pos:]
+                      changed = True
+              else:
+                  raise RuntimeError(
+                      "refresh.py contains only part of a KPI-history implementation; refusing a partial upgrade."
+                  )
+
+              if "history = update_kpi_history(previous, incidents, lgas)" not in text:
+                  data_anchor = "    data = {\n"
+                  if data_anchor not in text:
+                      raise RuntimeError("Marine trend patch could not locate the dashboard data dictionary.")
+                  text = text.replace(
+                      data_anchor,
+                      "    history = update_kpi_history(previous, incidents, lgas)\n\n" + data_anchor,
+                      1,
+                  )
+                  changed = True
+
+              if '"history": history,' not in text:
+                  incidents_anchor = '        "incidents": incidents,\n'
+                  if incidents_anchor not in text:
+                      raise RuntimeError("Marine trend patch could not locate the incidents field in dashboard data.")
+                  text = text.replace(
+                      incidents_anchor,
+                      incidents_anchor + '        "history": history,\n',
+                      1,
+                  )
+                  changed = True
+
+              required = (
+                  "def calculate_kpi_snapshot(",
+                  "def update_kpi_history(",
+                  '"marine": len(marine),',
+                  "history = update_kpi_history(previous, incidents, lgas)",
+                  '"history": history,',
               )
-              match = function_pattern.search(text)
-              if not match:
-                  raise RuntimeError("Marine trend patch could not locate calculate_kpi_snapshot().")
+              for token in required:
+                  if token not in text:
+                      raise RuntimeError(f"Marine trend refresh validation failed: missing {token!r}.")
 
-              block = match.group(0)
-              if REFRESH_MARKER not in block:
-                  schools_line = '    schools = [item for item in incidents if item.get("sector") == "schools"]\n'
-                  if schools_line not in block:
-                      raise RuntimeError("Marine trend patch could not find the schools KPI snapshot anchor.")
-                  block = block.replace(
-                      schools_line,
-                      schools_line
-                      + f"    {REFRESH_MARKER}\n"
-                      + '    marine = [item for item in incidents if item.get("sector") == "marine"]\n',
-                      1,
-                  )
-                  changed = True
-
-              if '"marine": len(marine),' not in block:
-                  history_anchor = '        "schools": len(schools),\n        "lgas": len(affected_lgas),\n'
-                  if history_anchor not in block:
-                      raise RuntimeError("Marine trend patch could not find the KPI history return anchor.")
-                  block = block.replace(
-                      history_anchor,
-                      '        "schools": len(schools),\n'
-                      '        "marine": len(marine),\n'
-                      '        "lgas": len(affected_lgas),\n',
-                      1,
-                  )
-                  changed = True
-
-              text = text[:match.start()] + block + text[match.end():]
-              if REFRESH_MARKER not in text or '"marine": len(marine),' not in text:
-                  raise RuntimeError("Marine trend refresh validation failed.")
               compile(text, str(REFRESH), "exec")
               return text, changed
 
 
           def patch_index(text: str) -> tuple[str, bool]:
               changed = False
-
               marine_card_pattern = re.compile(
                   r'(?ms)(<article\b[^>]*data-kpi-sector=["\']marine["\'][^>]*>.*?</article>)'
               )
@@ -1536,33 +1671,47 @@ jobs:
               card_match = cards[0]
               card = card_match.group(1)
               if 'id="marineTrend"' not in card:
-                  close_index = card.rfind("</article>")
-                  if close_index < 0:
-                      raise RuntimeError("Marine trend patch could not find the Marine card closing tag.")
-                  indent_match = re.search(r'(?m)^(\s*)<div class="metric-detail" id="marineDetail"', card)
-                  indent = indent_match.group(1) if indent_match else "          "
-                  trend_html = (
-                      f'{indent}{INDEX_MARKER}\n'
-                      f'{indent}<div class="metric-trend trend-pending" id="marineTrend" aria-live="polite">'
-                      '<span class="trend-copy"><span class="trend-direction">Collecting trend</span></span></div>\n'
+                  detail_match = re.search(
+                      r'(?m)^(?P<indent>\s*)<div class="metric-detail" id="marineDetail"[^>]*>.*?</div>\s*$',
+                      card,
                   )
-                  card = card[:close_index] + trend_html + card[close_index:]
+                  if detail_match:
+                      insert_at = detail_match.end()
+                      indent = detail_match.group("indent")
+                  else:
+                      close_index = card.rfind("</article>")
+                      if close_index < 0:
+                          raise RuntimeError("Marine trend patch could not find the Marine card insertion point.")
+                      insert_at = close_index
+                      indent = "          "
+                  trend_html = (
+                      f'\n{indent}{INDEX_MARKER}\n'
+                      f'{indent}<div class="metric-trend trend-pending" id="marineTrend" aria-live="polite">'
+                      '<span class="trend-copy"><span class="trend-direction">Collecting trend</span></span></div>'
+                  )
+                  card = card[:insert_at] + trend_html + card[insert_at:]
                   text = text[:card_match.start()] + card + text[card_match.end():]
                   changed = True
 
               config_pattern = re.compile(
-                  r"(?ms)(const KPI_TREND_CONFIG = Object\.freeze\(\{\n)(.*?)(^\s*\}\);)"
+                  r"(?ms)(const\s+KPI_TREND_CONFIG\s*=\s*Object\.freeze\(\s*\{)(.*?)(\}\s*\)\s*;)"
               )
               config_match = config_pattern.search(text)
               if not config_match:
                   raise RuntimeError("Marine trend patch could not locate KPI_TREND_CONFIG.")
               config_body = config_match.group(2)
-              if "elementId:'marineTrend'" not in config_body:
-                  lga_match = re.search(r"(?m)^(?P<indent>\s*)lgas:\{", config_body)
-                  if not lga_match:
-                      raise RuntimeError("Marine trend patch could not find the LGA trend config anchor.")
-                  insert_at = lga_match.start()
-                  indent = lga_match.group("indent")
+              marine_config_re = re.compile(
+                  r"\bmarine\s*:\s*\{[^}]*elementId\s*:\s*['\"]marineTrend['\"]"
+              )
+              if not marine_config_re.search(config_body):
+                  lga_match = re.search(r"(?m)^(?P<indent>\s*)lgas\s*:\s*\{", config_body)
+                  if lga_match:
+                      insert_at = lga_match.start()
+                      indent = lga_match.group("indent")
+                  else:
+                      insert_at = len(config_body)
+                      indent_match = re.search(r"(?m)^(\s*)[A-Za-z_][A-Za-z0-9_]*\s*:\s*\{", config_body)
+                      indent = indent_match.group(1) if indent_match else "      "
                   marine_config = (
                       f"{indent}marine:{{elementId:'marineTrend',field:'marine',hours:24,label:'Marine warnings'}},\n"
                   )
@@ -1576,11 +1725,7 @@ jobs:
                   text = text.replace(old_comment, new_comment, 1)
                   changed = True
 
-              required = (
-                  INDEX_MARKER,
-                  'id="marineTrend"',
-                  "marine:{elementId:'marineTrend',field:'marine',hours:24,label:'Marine warnings'}",
-              )
+              required = ('id="marineTrend"', "field:'marine'", "hours:24")
               for token in required:
                   if token not in text:
                       raise RuntimeError(f"Marine trend index validation failed: missing {token!r}.")
@@ -1592,7 +1737,6 @@ jobs:
           def main() -> int:
               if not REFRESH.exists() or not INDEX.exists():
                   raise SystemExit("Marine trend patch requires refresh.py and index.html.")
-
               refresh_original = REFRESH.read_text(encoding="utf-8")
               index_original = INDEX.read_text(encoding="utf-8")
               try:
@@ -1607,7 +1751,7 @@ jobs:
                   INDEX.write_text(index_patched, encoding="utf-8")
 
               if refresh_changed or index_changed:
-                  print("Marine KPI trend enabled: 24-hour warning-count history using the existing KPI trend renderer.")
+                  print("Marine KPI trend enabled: KPI history installed/preserved and 24-hour Marine trend added.")
               else:
                   print("Marine KPI trend is already enabled; no changes required.")
               return 0
