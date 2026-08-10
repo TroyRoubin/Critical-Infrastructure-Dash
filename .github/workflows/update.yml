@@ -1,40 +1,44 @@
-name: Refresh dashboard
+name: Refresh and deploy dashboard
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "7,22,37,52 * * * *"
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - "index.html"
-      - "refresh.py"
-      - "apply_qldtraffic_filter_v7.py"
-      - "requirements.txt"
-      - ".github/workflows/update.yml"
+      - index.html
+      - refresh.py
+      - requirements.txt
+      - .github/workflows/update.yml
+  schedule:
+    # Every 15 minutes, offset from the busiest start-of-hour period.
+    - cron: "2,17,32,47 * * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 concurrency:
-  group: critical-infrastructure-dashboard-refresh-main
+  group: qld-dashboard-main
   cancel-in-progress: false
 
 jobs:
-  refresh-dashboard:
+  refresh-and-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Check out latest main
-        uses: actions/checkout@v4
+      - name: Get latest repository
+        uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -47,13 +51,10 @@ jobs:
             python -m pip install -r requirements.txt
           fi
 
-      - name: Apply QLDTraffic Hazard and Flooding mode
-        run: python apply_qldtraffic_filter_v7.py
-
-      - name: Refresh dashboard data
+      - name: Refresh live feeds
         run: python refresh.py
 
-      - name: Commit and push refreshed dashboard
+      - name: Save latest snapshot in the repository
         shell: bash
         run: |
           set -euo pipefail
@@ -64,38 +65,60 @@ jobs:
           git add index.html
 
           if git diff --cached --quiet; then
-            echo "No dashboard changes to commit."
+            echo "No snapshot change to commit."
             exit 0
           fi
 
-          git commit -m "data: refresh dashboard"
+          # [skip ci] prevents this bot-generated index.html commit from
+          # starting another identical push-triggered workflow.
+          git commit -m "data: refresh dashboard [skip ci]"
 
           for attempt in 1 2 3; do
             echo "Push attempt ${attempt} of 3"
 
             if git push origin HEAD:main; then
-              echo "Dashboard refresh pushed successfully."
+              echo "Dashboard snapshot pushed successfully."
               exit 0
             fi
 
             echo "Remote main changed before the push completed."
-            echo "Rebuilding the refreshed dashboard from the latest main branch."
+            echo "Refreshing again from the latest main branch."
 
             git fetch origin main
             git reset --hard origin/main
 
-            python apply_qldtraffic_filter_v7.py
             python refresh.py
             git add index.html
 
             if git diff --cached --quiet; then
-              echo "The latest main branch already contains equivalent dashboard data."
+              echo "Latest main already contains equivalent dashboard data."
               exit 0
             fi
 
-            git commit -m "data: refresh dashboard"
+            git commit -m "data: refresh dashboard [skip ci]"
             sleep $((attempt * 2))
           done
 
           echo "Unable to push the refreshed dashboard after three attempts."
           exit 1
+
+      - name: Prepare site
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf _site
+          mkdir -p _site
+          cp index.html _site/index.html
+          touch _site/.nojekyll
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - name: Deploy site
+        id: deployment
+        uses: actions/deploy-pages@v4
