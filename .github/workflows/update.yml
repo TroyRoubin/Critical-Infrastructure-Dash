@@ -688,6 +688,34 @@ jobs:
           PY
           python /tmp/apply_multi_lga.py
 
+
+      - name: Rename dashboard
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/rename_dashboard.py <<'PY'
+          from pathlib import Path
+
+          path = Path("index.html")
+          old = "Queensland Operational Picture"
+          new = "Queensland Critical Infrastructure Dashboard"
+
+          text = path.read_text(encoding="utf-8")
+
+          if old in text:
+              count = text.count(old)
+              text = text.replace(old, new)
+              path.write_text(text, encoding="utf-8")
+              print(f"Dashboard renamed to: {new} ({count} occurrence(s) updated).")
+          elif new in text:
+              print(f"Dashboard title is already: {new}")
+          else:
+              raise SystemExit(
+                  f"Could not find expected dashboard title {old!r} or {new!r} in index.html."
+              )
+          PY
+          python /tmp/rename_dashboard.py
+
       - name: Save latest snapshot in the repository
         shell: bash
         run: |
@@ -733,6 +761,7 @@ jobs:
             python -m py_compile refresh.py
             python refresh.py
             python /tmp/apply_multi_lga.py
+            python /tmp/rename_dashboard.py
             git add refresh.py index.html
 
             if git diff --cached --quiet; then
