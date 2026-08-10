@@ -347,6 +347,7 @@ def fetch_lgas() -> dict[str, Any]:
 
 
 
+
 # QLDTraffic filter: Hazard + Flooding only
 # Queensland-only road geography filter
 QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
@@ -721,9 +722,10 @@ def parse_rail(xml_data: bytes) -> list[dict[str, Any]]:
 
 
 
+
 # Marine Warnings KPI: Maritime Safety Queensland v1
-# Marine verified browser source v7
-# The workflow renders the Guardian dashboard in Chromium and writes only verified current warning records to /tmp/msq-current-warnings.json.
+# Marine exact imsBulletin source v9
+# The workflow captures Guardian's /dashboard/imsBulletin FeatureCollection and writes verified current records to /tmp/msq-current-warnings.json.
 MSQ_BROWSER_SNAPSHOT = Path("/tmp/msq-current-warnings.json")
 
 MSQ_QLD_BOUNDS = {"min_lon": 137.8, "max_lon": 154.2, "min_lat": -29.3, "max_lat": -9.0}
@@ -806,17 +808,28 @@ def parse_msq_marine_warnings(lgas: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(item, dict): continue
         title = clean(item.get("title")); area = clean(item.get("area")); description = clean(item.get("description"))
         if not title or not area: raise RuntimeError("verified MSQ warning is missing its rendered title or area")
-        if clean(item.get("source_method")) not in {"rendered-visible-card", "rendered-visible-text-window", "structured-browser-network"}: raise RuntimeError("MSQ warning was not sourced from a verified browser evidence path")
-        coordinates, locality, lga, location_precision = _msq_warning_location(" ".join(filter(None, (area, title, description))), lgas)
+        method = clean(item.get("source_method"))
+        if method not in {"msq-imsBulletin-feature", "rendered-visible-card", "rendered-visible-text-window", "structured-browser-network"}:
+            raise RuntimeError("MSQ warning was not sourced from the verified imsBulletin/browser evidence path")
+        source_point = item.get("coordinates")
+        if _msq_point_in_qld(source_point):
+            coordinates = [round(float(source_point[0]), 6), round(float(source_point[1]), 6)]
+            locality = area
+            lga = locate_lga(coordinates, lgas) if lgas.get("features") else None
+            location_precision = clean(item.get("location_precision")) or "source-area-centroid"
+        else:
+            coordinates, locality, lga, location_precision = _msq_warning_location(" ".join(filter(None, (area, title, description))), lgas)
+        incident_id = clean(item.get("feature_id")) or stable_id(area, title)
         incidents.append({
-            "id": f"marine-{stable_id(area, title)}", "sector": "marine", "subtype": "warning", "event_category": "maritime warning",
+            "id": f"marine-{incident_id}", "sector": "marine", "subtype": "warning", "event_category": "maritime warning",
             "title": title[:220], "description": description[:3500], "status": clean(item.get("status")) or "Active maritime warning",
             "marine_alert_phase": clean(item.get("alert_phase")) or None, "marine_warning_level": clean(item.get("warning_level")) or None,
             "marine_action": clean(item.get("action")) or None, "marine_issued_text": clean(item.get("issued_text")) or None,
             "lga": lga, "locality": locality, "coordinates": coordinates, "geometry": None, "location_precision": location_precision,
-            "customers": 0, "planned": False, "updated": clean(payload.get("captured_at")) or NOW_ISO,
-            "source_name": "Maritime Safety Queensland", "source_url": SOURCES["marine"]["url"],
-            "source_method": "msq-verified-browser-current-warning",
+            "customers": 0, "planned": False,
+            "updated": clean(item.get("updated_iso")) or clean(payload.get("published")) or clean(payload.get("captured_at")) or NOW_ISO,
+            "source_name": "Maritime Safety Queensland", "source_url": clean(item.get("source_url")) or SOURCES["marine"]["url"],
+            "source_method": "msq-imsBulletin-current-warning", "marine_feature_id": clean(item.get("feature_id")) or None,
         })
     return incidents
 
