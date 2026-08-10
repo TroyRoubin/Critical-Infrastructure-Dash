@@ -345,6 +345,7 @@ def fetch_lgas() -> dict[str, Any]:
 
 
 
+
 # QLDTraffic filter: Hazard + Flooding only
 # Queensland-only road geography filter
 QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
@@ -718,10 +719,10 @@ def parse_rail(xml_data: bytes) -> list[dict[str, Any]]:
 
 
 
+
 # Marine Warnings KPI: Maritime Safety Queensland v1
-# Marine verified rendered-dashboard source v6
-# The workflow renders the Guardian dashboard in Chromium and writes only visible,
-# area-specific current warning cards to /tmp/msq-current-warnings.json.
+# Marine verified browser source v7
+# The workflow renders the Guardian dashboard in Chromium and writes only verified current warning records to /tmp/msq-current-warnings.json.
 MSQ_BROWSER_SNAPSHOT = Path("/tmp/msq-current-warnings.json")
 
 MSQ_QLD_BOUNDS = {"min_lon": 137.8, "max_lon": 154.2, "min_lat": -29.3, "max_lat": -9.0}
@@ -791,8 +792,8 @@ def _msq_snapshot() -> dict[str, Any]:
     if not MSQ_BROWSER_SNAPSHOT.exists(): raise RuntimeError("verified MSQ browser snapshot was not created by the workflow")
     try: payload = json.loads(MSQ_BROWSER_SNAPSHOT.read_text(encoding="utf-8"))
     except Exception as exc: raise RuntimeError(f"verified MSQ browser snapshot is unreadable: {exc}") from exc
-    if payload.get("schema") != "msq-rendered-current-v1": raise RuntimeError("verified MSQ browser snapshot has an unexpected schema")
-    if payload.get("status") != "current": raise RuntimeError(clean(payload.get("error")) or "MSQ rendered dashboard could not be verified")
+    if payload.get("schema") != "msq-browser-current-v2": raise RuntimeError("verified MSQ browser snapshot has an unexpected schema")
+    if payload.get("status") != "current": raise RuntimeError(clean(payload.get("error")) or "MSQ browser source could not be verified")
     warnings = payload.get("warnings")
     if not isinstance(warnings, list): raise RuntimeError("verified MSQ browser snapshot does not contain a warning list")
     if not warnings and not bool(payload.get("verified_zero")): raise RuntimeError("MSQ snapshot contains zero records without an explicit verified no-warning state")
@@ -804,7 +805,7 @@ def parse_msq_marine_warnings(lgas: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(item, dict): continue
         title = clean(item.get("title")); area = clean(item.get("area")); description = clean(item.get("description"))
         if not title or not area: raise RuntimeError("verified MSQ warning is missing its rendered title or area")
-        if clean(item.get("source_method")) != "rendered-visible-card": raise RuntimeError("MSQ warning was not sourced from a verified rendered warning card")
+        if clean(item.get("source_method")) not in {"rendered-visible-card", "rendered-visible-text-window", "structured-browser-network"}: raise RuntimeError("MSQ warning was not sourced from a verified browser evidence path")
         coordinates, locality, lga, location_precision = _msq_warning_location(" ".join(filter(None, (area, title, description))), lgas)
         incidents.append({
             "id": f"marine-{stable_id(area, title)}", "sector": "marine", "subtype": "warning", "event_category": "maritime warning",
@@ -814,7 +815,7 @@ def parse_msq_marine_warnings(lgas: dict[str, Any]) -> list[dict[str, Any]]:
             "lga": lga, "locality": locality, "coordinates": coordinates, "geometry": None, "location_precision": location_precision,
             "customers": 0, "planned": False, "updated": clean(payload.get("captured_at")) or NOW_ISO,
             "source_name": "Maritime Safety Queensland", "source_url": SOURCES["marine"]["url"],
-            "source_method": "msq-rendered-visible-current-warning",
+            "source_method": "msq-verified-browser-current-warning",
         })
     return incidents
 
