@@ -604,14 +604,35 @@ jobs:
           '''
           
           
-          TOP_LGA_CARD_PATTERN = re.compile(
-              r'''        <article class="metric" style="--tone:#a58cf2" data-kpi-sector="all"[^>]*>\s*'''
-              r'''<div class="metric-label">LGAs affected</div>\s*'''
-              r'''<div class="metric-value" id="lgaValue">0</div>\s*'''
-              r'''<div class="metric-detail">within current filters</div>\s*'''
-              r'''</article>\s*''',
-              re.S,
+          METRIC_ARTICLE_PATTERN = re.compile(
+              r'''(?ms)^[ \t]*<article\b[^>]*>.*?</article>[ \t]*(?:\n|$)'''
           )
+
+
+          def replace_top_lga_card(text: str) -> str:
+              """Replace the existing top-row LGA KPI without depending on its styling.
+
+              Earlier workflow versions changed the card's tone, attributes and initial
+              value, so matching the full HTML block made this patch unnecessarily
+              brittle. The stable identifiers are the lgaValue element and its visible
+              "LGAs affected" label.
+              """
+              matches = []
+              for match in METRIC_ARTICLE_PATTERN.finditer(text):
+                  block = match.group(0)
+                  has_value = re.search(r'''\bid=["']lgaValue["']''', block, re.I)
+                  has_label = re.search(r'''>\s*LGAs\s+affected\s*<''', block, re.I)
+                  if has_value and has_label:
+                      matches.append(match)
+
+              if len(matches) != 1:
+                  raise RuntimeError(
+                      "Marine KPI patch expected one top-row LGAs affected card "
+                      f"identified by lgaValue; found {len(matches)}."
+                  )
+
+              match = matches[0]
+              return text[:match.start()] + MARINE_CARD + text[match.end():]
           
           
           def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -699,9 +720,7 @@ jobs:
               css_anchor = "    .metric-detail{margin-top:4px;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\n"
               text = replace_once(text, css_anchor, css_anchor + "\n" + INDEX_CSS_BLOCK, "metric-detail CSS anchor")
           
-              text, count = TOP_LGA_CARD_PATTERN.subn(MARINE_CARD, text, count=1)
-              if count != 1:
-                  raise RuntimeError(f"Marine KPI patch expected one top-row LGAs affected card; found {count}.")
+              text = replace_top_lga_card(text)
           
               focus_anchor = '''            <div class="panel-subtitle">Filter active disruptions by location, sector, or search term</div>
                     </div>
