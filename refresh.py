@@ -1,464 +1,797 @@
 #!/usr/bin/env python3
-"""Add the MSQ Marine Warnings KPI to the Critical Infrastructure Dashboard.
+"""Refresh the data embedded in index.html.
 
-This is an idempotent repository patcher. It updates both refresh.py and
-index.html while deliberately leaving the existing QLDTraffic, Queensland-only,
-multi-LGA and dashboard-title patches untouched.
+Run locally with:  python refresh.py
+Then commit/push index.html to the GitHub Pages branch.
 
-Marine data is fetched from the public Maritime Safety Queensland dashboard.
-Because that site is a JavaScript application, the parser is intentionally
-fail-closed: a zero is accepted only when the returned document explicitly says
-there are no current maritime/marine warnings. If the public page exposes only
-its application shell, refresh.py raises an error so the dashboard displays the
-source as unavailable (or keeps a previously verified fallback) instead of
-showing a false zero.
+This script uses only the Python standard library. Each source is isolated; if a
+source fails, its last successfully embedded records are retained and marked as
+fallback data.
 """
 from __future__ import annotations
 
-from pathlib import Path
+import difflib
+import hashlib
+import html
+import http.cookiejar
+import json
 import re
+import ssl
+import sys
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
-REFRESH = ROOT / "refresh.py"
 INDEX = ROOT / "index.html"
+AEST = timezone(timedelta(hours=10))
+NOW = datetime.now(AEST)
+NOW_ISO = NOW.isoformat(timespec="seconds")
 
-REFRESH_MARKER = "# Marine Warnings KPI: Maritime Safety Queensland v1"
-INDEX_MARKER = "/* Marine Warnings KPI v1 */"
-MSQ_URL = "https://qldmaritime.msq.qld.gov.au/"
+SOURCES = {
+    "qldtraffic": {
+        "name": "QLDTraffic",
+        "url": "https://data.qldtraffic.qld.gov.au/events_v2.geojson",
+    },
+    "energex": {
+        "name": "Energex",
+        "url": "https://services.arcgis.com/bfVzktoY0OhzQCDj/ArcGIS/rest/services/VwEnergexOutages/FeatureServer/0/query",
+    },
+    "ergon": {
+        "name": "Ergon Energy",
+        "url": "https://services.arcgis.com/33eHbTVqo7gtiCE8/arcgis/rest/services/VwErgonOutages/FeatureServer/0/query",
+    },
+    "schools": {
+        "name": "Queensland school closures",
+        "url": "https://closures.qld.edu.au/DataFiles/plain.txt",
+    },
+    "rail": {
+        "name": "Translink train disruptions",
+        "url": "https://translink.com.au/service-updates/rss/train",
+    },
+    "geography": {
+        "name": "Queensland LGA boundaries",
+        "url": "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Basemaps/FoundationData/FeatureServer/7/query",
+    },
+}
 
-
-MARINE_PARSER_BLOCK = r'''
-# Marine Warnings KPI: Maritime Safety Queensland v1
-MSQ_NO_WARNING_PHRASES = (
-    "no current maritime warnings",
-    "no active maritime warnings",
-    "there are no current maritime warnings",
-    "there are no active maritime warnings",
-    "no current marine warnings",
-    "no active marine warnings",
-    "there are no current marine warnings",
-    "there are no active marine warnings",
-)
-
-MSQ_GENERIC_WARNING_LABELS = {
-    "marine warning",
-    "marine warnings",
-    "maritime warning",
-    "maritime warnings",
-    "warnings",
-    "current warnings",
-    "maritime safety queensland",
-    "opt in notifications",
+SCHOOL_MAPSERVER = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Society/SchoolsAndSchoolCatchments/MapServer"
+SCHOOL_LAYERS = (4, 5, 6, 7, 8, 9)
+DATA_START = "/*DATA_START*/"
+DATA_END = "/*DATA_END*/"
+POWER_ARCGIS_PARAMS = {
+    "where": "1=1",
+    "outFields": "*",
+    "returnGeometry": "true",
+    "outSR": "4326",
+    "f": "geojson",
 }
 
 
-class _MSQVisibleTextParser(HTMLParser):
-    """Extract visible text lines without executing dashboard JavaScript."""
+def clean(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
-    _BREAK_TAGS = {
-        "address", "article", "aside", "br", "dd", "div", "dl", "dt",
-        "figcaption", "footer", "h1", "h2", "h3", "h4", "h5", "h6",
-        "header", "li", "main", "nav", "p", "section", "table", "td",
-        "th", "tr", "ul",
+
+def norm(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", clean(value).lower()).strip()
+
+
+def title_case(value: Any) -> str:
+    return " ".join(word if i and word in {"of", "and", "the"} else word.capitalize() for i, word in enumerate(clean(value).lower().split()))
+
+
+def stable_id(*parts: Any) -> str:
+    raw = "|".join(clean(part) for part in parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:14]
+
+
+def get_bytes(url: str, params: dict[str, Any] | None = None, timeout: int = 30) -> bytes:
+    """Retrieve a public feed using browser-like headers.
+
+    Energy Queensland's web firewall rejects obvious script user agents with
+    HTTP 403. For Energex and Ergon, establish a normal website session first,
+    retain its cookies, then request the GeoJSON with the same headers used by
+    a browser. Other feeds use the same opener without the warm-up request.
+    """
+    if params:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}{urllib.parse.urlencode(params)}"
+
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    is_energy_qld = host in {"www.energex.com.au", "www.ergon.com.au"}
+    site_root = f"{parsed.scheme}://{parsed.netloc}"
+    referer = (
+        f"{site_root}/outages/outage-finder"
+        if host == "www.energex.com.au"
+        else f"{site_root}/network/outages/outage-finder"
+        if host == "www.ergon.com.au"
+        else site_root + "/"
+    )
+
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/geo+json, application/json, text/plain, application/xml, text/xml, */*",
+        "Accept-Language": "en-AU,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": referer,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     }
 
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        self._skip_depth = 0
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        tag = tag.lower()
-        if tag in {"script", "style"}:
-            self._skip_depth += 1
-            return
-        if not self._skip_depth and tag in self._BREAK_TAGS:
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        tag = tag.lower()
-        if tag in {"script", "style"}:
-            self._skip_depth = max(0, self._skip_depth - 1)
-            return
-        if not self._skip_depth and tag in self._BREAK_TAGS:
-            self.parts.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        if not self._skip_depth:
-            self.parts.append(data)
-
-    def lines(self) -> list[str]:
-        return [clean(line) for line in "".join(self.parts).splitlines() if clean(line)]
-
-
-def _msq_warning_candidate(value: Any) -> str | None:
-    text = clean(html.unescape(str(value or "")))
-    if len(text) < 12 or len(text) > 500:
-        return None
-
-    key = norm(text)
-    if not key or key in MSQ_GENERIC_WARNING_LABELS:
-        return None
-    if key.startswith("opt in notification") or key in {"sign in", "register"}:
-        return None
-
-    # Strong phrases that identify an operational maritime warning rather than
-    # a navigation label or general preparedness link on the dashboard shell.
-    strong_phrases = (
-        "port closed",
-        "port closure",
-        "pilotage area closed",
-        "waterway closed",
-        "closed to vessel traffic",
-        "closed to all vessel traffic",
-        "navigation warning",
-        "hazard to navigation",
-        "marine warning in place",
-        "marine warnings in place",
-        "maritime warning in place",
-        "maritime warnings in place",
-        "extreme weather warning",
-        "red alert",
-        "orange alert",
-        "yellow alert",
-        "white alert",
+    cookie_jar = http.cookiejar.CookieJar()
+    context = ssl.create_default_context()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context),
+        urllib.request.HTTPCookieProcessor(cookie_jar),
     )
-    if any(phrase in key for phrase in strong_phrases):
-        return text
 
-    # Also accept a descriptive warning sentence when it contains both a
-    # maritime subject and an active/impact qualifier.
-    maritime_terms = (
-        "port", "pilotage", "waterway", "navigation", "harbour", "harbor",
-        "vessel", "marine", "maritime", "cyclone", "storm", "swell", "flood",
-    )
-    active_terms = (
-        "active", "current", "closed", "closure", "hazard", "danger",
-        "alert", "issued", "effective", "restricted", "restriction",
-    )
-    if "warning" in key and any(term in key for term in maritime_terms) and any(term in key for term in active_terms):
-        return text
+    # Warm up the Energy Queensland session so any edge/WAF cookies issued by
+    # the public outage page are sent with the subsequent GeoJSON request.
+    if is_energy_qld:
+        warm_headers = dict(browser_headers)
+        warm_headers.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+        })
+        try:
+            warm_request = urllib.request.Request(referer, headers=warm_headers)
+            with opener.open(warm_request, timeout=timeout) as response:
+                response.read(1024)
+        except Exception:
+            # The feed request may still succeed without the warm-up page.
+            pass
 
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            request_url = url
+            if is_energy_qld:
+                separator = "&" if "?" in request_url else "?"
+                request_url = f"{request_url}{separator}_={int(time.time())}"
+            request = urllib.request.Request(request_url, headers=browser_headers)
+            with opener.open(request, timeout=timeout) as response:
+                return response.read()
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+
+    hint = ""
+    if is_energy_qld and "403" in str(last_error):
+        hint = " (Energy Queensland blocked the GitHub runner despite browser headers)"
+    raise RuntimeError(f"Unable to retrieve {url}: {last_error}{hint}")
+
+
+def get_json(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    return json.loads(get_bytes(url, params).decode("utf-8-sig"))
+
+
+def parse_date(value: Any) -> datetime | None:
+    # The ArcGIS outage layers return START and EST_FIX_TIME as Unix epoch
+    # milliseconds. Retain support for epoch seconds and the existing text dates.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(AEST)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    text = clean(value)
+    if not text:
+        return None
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        try:
+            timestamp = float(text)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(AEST)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    candidates = (text, text.replace("Z", "+00:00"))
+    for candidate in candidates:
+        try:
+            result = datetime.fromisoformat(candidate)
+            if result.tzinfo is None:
+                result = result.replace(tzinfo=AEST)
+            return result.astimezone(AEST)
+        except ValueError:
+            pass
+    for fmt in ("%I:%M%p %d %b %Y", "%I:%M %p %d %b %Y", "%a, %d %b %Y %H:%M:%S %z", "%d/%m/%Y %H:%M"):
+        try:
+            result = datetime.strptime(text, fmt)
+            if result.tzinfo is None:
+                result = result.replace(tzinfo=AEST)
+            return result.astimezone(AEST)
+        except ValueError:
+            pass
     return None
 
 
-def _msq_unique_candidates(values: list[str]) -> list[str]:
-    candidates = []
-    for value in values:
-        candidate = _msq_warning_candidate(value)
-        if candidate:
-            candidates.append(candidate)
+def iso(value: Any) -> str | None:
+    parsed = value if isinstance(value, datetime) else parse_date(value)
+    return parsed.isoformat(timespec="seconds") if parsed else None
 
-    # Prefer concise card/title text when a longer captured block contains the
-    # same warning. This avoids counting one dashboard card multiple times.
-    unique: list[tuple[str, str]] = []
-    for candidate in sorted(candidates, key=lambda item: (len(item), item.lower())):
-        key = norm(candidate)
-        if any(key == existing or (len(key) >= 24 and (key in existing or existing in key)) for existing, _ in unique):
-            continue
-        unique.append((key, candidate))
 
-    if len(unique) > 40:
-        raise RuntimeError(
-            "MSQ dashboard warning extraction was ambiguous (more than 40 candidate blocks); "
-            "refusing to publish a potentially misleading KPI."
+def active_now(start: Any, end: Any) -> bool:
+    start_dt, end_dt = parse_date(start), parse_date(end)
+    return not ((start_dt and start_dt > NOW + timedelta(minutes=3)) or (end_dt and end_dt < NOW - timedelta(minutes=3)))
+
+
+def all_points(geometry: dict[str, Any] | None) -> list[list[float]]:
+    points: list[list[float]] = []
+    if not geometry:
+        return points
+    if geometry.get("type") == "GeometryCollection":
+        for item in geometry.get("geometries", []):
+            points.extend(all_points(item))
+        return points
+
+    def walk(value: Any) -> None:
+        if isinstance(value, list) and len(value) >= 2 and all(isinstance(item, (int, float)) for item in value[:2]):
+            points.append([float(value[0]), float(value[1])])
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(geometry.get("coordinates"))
+    return points
+
+
+def representative_point(geometry: dict[str, Any] | None) -> list[float] | None:
+    if not geometry:
+        return None
+    if geometry.get("type") == "GeometryCollection":
+        for item in geometry.get("geometries", []):
+            if item.get("type") == "Point":
+                coords = item.get("coordinates") or []
+                if len(coords) >= 2:
+                    return [float(coords[0]), float(coords[1])]
+    if geometry.get("type") == "Point":
+        coords = geometry.get("coordinates") or []
+        return [float(coords[0]), float(coords[1])] if len(coords) >= 2 else None
+    points = all_points(geometry)
+    if not points:
+        return None
+    return [round(sum(p[0] for p in points) / len(points), 6), round(sum(p[1] for p in points) / len(points), 6)]
+
+
+def point_in_ring(point: list[float], ring: list[list[float]]) -> bool:
+    x, y = point
+    inside = False
+    if len(ring) < 3:
+        return False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i][:2]
+        xj, yj = ring[j][:2]
+        if ((yi > y) != (yj > y)) and x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def point_in_geometry(point: list[float], geometry: dict[str, Any] | None) -> bool:
+    if not geometry:
+        return False
+    kind = geometry.get("type")
+    coordinates = geometry.get("coordinates") or []
+    polygons = [coordinates] if kind == "Polygon" else coordinates if kind == "MultiPolygon" else []
+    for polygon in polygons:
+        if polygon and point_in_ring(point, polygon[0]) and not any(point_in_ring(point, hole) for hole in polygon[1:]):
+            return True
+    return False
+
+
+def lga_name(properties: dict[str, Any]) -> str:
+    lowered = {norm(key).replace(" ", "_"): value for key, value in properties.items()}
+    value = lowered.get("adminareaname") or lowered.get("admin_area_name") or lowered.get("name") or lowered.get("display_name")
+    return title_case(value) if value else "Unknown LGA"
+
+
+def locate_lga(point: list[float] | None, lgas: dict[str, Any]) -> str | None:
+    if not point:
+        return None
+    for feature in lgas.get("features", []):
+        if point_in_geometry(point, feature.get("geometry")):
+            return feature.get("properties", {}).get("display_name")
+    return None
+
+
+def fetch_lgas() -> dict[str, Any]:
+    raw = get_json(
+        SOURCES["geography"]["url"],
+        {
+            "where": "1=1",
+            "outFields": "*",
+            "returnGeometry": "true",
+            "outSR": "4326",
+            "f": "geojson",
+            "geometryPrecision": "5",
+            "maxAllowableOffset": "0.0025",
+        },
+    )
+    features = []
+    for feature in raw.get("features", []):
+        name = lga_name(feature.get("properties") or {})
+        features.append({"type": "Feature", "geometry": feature.get("geometry"), "properties": {"display_name": name}})
+    if not features:
+        raise RuntimeError("LGA service returned no features")
+    return {"type": "FeatureCollection", "features": features}
+
+
+
+# QLDTraffic filter: Hazard + Flooding only
+# Queensland-only road geography filter
+QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
+
+# Fast coarse bounds used before the exact Queensland LGA check.
+# Coordinates are GeoJSON order: [longitude, latitude].
+QLDTRAFFIC_QLD_BOUNDS = {
+    "min_lon": 137.8,
+    "max_lon": 153.7,
+    "min_lat": -29.25,
+    "max_lat": -9.0,
+}
+
+
+def qldtraffic_event_category(properties: dict[str, Any]) -> str | None:
+    category = norm(properties.get("event_type"))
+    return category if category in QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES else None
+
+
+def qldtraffic_in_qld_bounds(point: list[float] | None) -> bool:
+    if not point or len(point) < 2:
+        return False
+    lon, lat = float(point[0]), float(point[1])
+    return (
+        QLDTRAFFIC_QLD_BOUNDS["min_lon"] <= lon <= QLDTRAFFIC_QLD_BOUNDS["max_lon"]
+        and QLDTRAFFIC_QLD_BOUNDS["min_lat"] <= lat <= QLDTRAFFIC_QLD_BOUNDS["max_lat"]
+    )
+
+
+def qldtraffic_coordinate_in_queensland(
+    point: list[float] | None,
+    lgas: dict[str, Any],
+) -> tuple[bool, str | None]:
+    if not qldtraffic_in_qld_bounds(point):
+        return False, None
+
+    # When the embedded Queensland LGA polygons are available, use
+    # them as the authoritative state-boundary test.
+    if lgas.get("features"):
+        lga = locate_lga(point, lgas)
+        return (lga is not None), lga
+
+    # If LGA geometry is temporarily unavailable, retain the coarse
+    # Queensland bounding-box safeguard rather than displaying
+    # obviously interstate records.
+    return True, None
+
+
+def qldtraffic_location_in_queensland(
+    geometry: dict[str, Any] | None,
+    lgas: dict[str, Any],
+) -> tuple[list[float] | None, str | None]:
+    # Try the representative point first. For line/polygon events near
+    # a border, also sample several actual geometry vertices so a
+    # centroid outside Queensland does not discard a valid QLD event.
+    candidates: list[list[float]] = []
+
+    representative = representative_point(geometry)
+    if representative:
+        candidates.append(representative)
+
+    points = all_points(geometry)
+    if points:
+        indexes = (
+            0,
+            len(points) // 4,
+            len(points) // 2,
+            (3 * len(points)) // 4,
+            len(points) - 1,
         )
-    return [candidate for _, candidate in unique]
+        for index in indexes:
+            point = points[index]
+            if point not in candidates:
+                candidates.append(point)
+
+    for point in candidates:
+        inside, lga = qldtraffic_coordinate_in_queensland(point, lgas)
+        if inside:
+            return point, lga
+
+    return None, None
 
 
-def parse_msq_marine_warnings(html_data: bytes) -> list[dict[str, Any]]:
-    """Parse active warnings from the public MSQ dashboard, failing closed.
+def qldtraffic_fallback_records(
+    records: list[dict[str, Any]],
+    lgas: dict[str, Any],
+) -> list[dict[str, Any]]:
+    # Cached road records must satisfy BOTH the event-category filter
+    # and the Queensland geography filter.
+    filtered = []
+    for item in records:
+        category = norm(item.get("event_category") or item.get("event_type"))
+        if category not in QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES:
+            continue
 
-    A verified explicit no-warning message is the only condition that produces
-    a trustworthy zero. If the server returns only the JavaScript application
-    shell, raise so source health reports the feed as unavailable rather than 0.
-    """
-    raw = html_data.decode("utf-8-sig", errors="replace")
-    if not clean(raw):
-        raise RuntimeError("MSQ dashboard returned an empty response")
+        inside, _ = qldtraffic_coordinate_in_queensland(
+            item.get("coordinates"),
+            lgas,
+        )
+        if inside:
+            filtered.append(item)
 
-    parser = _MSQVisibleTextParser()
-    parser.feed(raw)
-    visible_lines = parser.lines()
-    visible_key = norm(" ".join(visible_lines))
+    return filtered
 
-    if any(phrase in visible_key for phrase in MSQ_NO_WARNING_PHRASES):
-        return []
 
-    # Some Guardian/QIT dashboard deployments place public card payloads in
-    # script/JSON strings even when the main page is client-rendered. Inspect
-    # string values as a secondary path, without executing any JavaScript.
-    script_strings = []
-    for match in re.finditer(r"[\"']([^\"'\r\n]{12,500})[\"']", raw):
-        value = match.group(1)
-        if "warning" in value.lower() or "alert" in value.lower() or "closed" in value.lower():
-            script_strings.append(value.replace(r"\u0026", "&").replace(r"\/", "/"))
-
-    warnings = _msq_unique_candidates(visible_lines + script_strings)
-    if not warnings:
-        shell_key = norm(raw)
-        if "maritime safety queensland" in shell_key or "powered by qit plus" in shell_key:
-            raise RuntimeError(
-                "MSQ dashboard returned its application shell, but the active maritime-warning state "
-                "was not present in the server response"
-            )
-        raise RuntimeError("Unable to verify the active maritime-warning state from the MSQ dashboard")
-
+def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str, Any]]:
     incidents = []
-    for warning in warnings:
-        title = warning if len(warning) <= 170 else warning[:167].rstrip() + "…"
-        description = "" if title == warning else warning
+
+    for feature in payload.get("features", []):
+        props = feature.get("properties") or {}
+
+        # KPI inclusion filter: QLDTraffic Hazards + Flooding only.
+        event_category = qldtraffic_event_category(props)
+        if event_category is None:
+            continue
+
+        if norm(props.get("status")) not in {"", "active", "published"}:
+            continue
+
+        duration = props.get("duration") or {}
+        if not active_now(duration.get("start"), duration.get("end")):
+            continue
+
+        summary = props.get("road_summary") or {}
+        geometry = feature.get("geometry")
+
+        # Map/state inclusion filter: Queensland only.
+        coords, qld_lga = qldtraffic_location_in_queensland(geometry, lgas)
+        if coords is None:
+            continue
+
+        impact = props.get("impact") or {}
+        impact_type = clean(impact.get("impact_type"))
+        impact_subtype = clean(impact.get("impact_subtype"))
+        combined = norm(f"{impact_type} {impact_subtype}")
+
+        if "closure" in combined or "closed" in combined:
+            subtype = "closure"
+        elif "lane" in combined or "restriction" in combined:
+            subtype = "restriction"
+        else:
+            subtype = "incident"
+
+        # Prefer the LGA proved by the Queensland polygon check.
+        lga = qld_lga or clean(summary.get("local_government_area"))
+        road = clean(summary.get("road_name")) or "Queensland road"
+
+        event_type = clean(props.get("event_type")) or title_case(event_category)
+        event_subtype = clean(props.get("event_subtype"))
+        event_due_to = clean(props.get("event_due_to"))
+        status = impact_subtype or impact_type or event_subtype or event_type
+
         incidents.append({
-            "id": f"marine-{stable_id(warning)}",
-            "sector": "marine",
-            "subtype": "warning",
-            "event_category": "maritime warning",
-            "title": title,
-            "description": description,
-            "status": "Active maritime warning",
-            "lga": None,
-            "locality": "Queensland maritime network",
-            "coordinates": None,
-            "geometry": None,
+            "id": f"roads-{props.get('id') or stable_id(road, event_type, duration.get('start'))}",
+            "sector": "roads",
+            "subtype": subtype,
+            "event_category": event_category,
+            "event_type": event_type,
+            "event_subtype": event_subtype,
+            "event_due_to": event_due_to,
+            "title": f"{road}: {status or event_type}",
+            "description": clean(props.get("description")),
+            "status": status,
+            "lga": lga,
+            "locality": clean(summary.get("locality")),
+            "coordinates": coords,
+            "geometry": geometry,
             "customers": 0,
             "planned": False,
+            "updated": iso(props.get("last_updated")) or NOW_ISO,
+            "source_name": "QLDTraffic",
+            "source_url": clean(props.get("url") or props.get("web_link"))
+                or SOURCES["qldtraffic"]["url"],
+        })
+
+    return incidents
+
+
+def property_value(properties: dict[str, Any], *names: str) -> Any:
+    index = {re.sub(r"[^a-z0-9]", "", str(key).lower()): value for key, value in properties.items()}
+    for name in names:
+        key = re.sub(r"[^a-z0-9]", "", name.lower())
+        if key in index:
+            return index[key]
+    return None
+
+
+def parse_int(value: Any) -> int:
+    match = re.search(r"[\d,]+", clean(value))
+    return int(match.group(0).replace(",", "")) if match else 0
+
+
+def power_geometry(geometry: dict[str, Any] | None) -> tuple[list[float] | None, dict[str, Any] | None]:
+    if not geometry:
+        return None, None
+    if geometry.get("type") != "GeometryCollection":
+        return representative_point(geometry), geometry if geometry.get("type") in {"Polygon", "MultiPolygon"} else None
+    point = None
+    polygons = []
+    for item in geometry.get("geometries", []):
+        if item.get("type") == "Point" and point is None:
+            point = representative_point(item)
+        elif item.get("type") in {"Polygon", "MultiPolygon"}:
+            polygons.append(item)
+    footprint = polygons[0] if len(polygons) == 1 else {"type": "GeometryCollection", "geometries": polygons} if polygons else None
+    return point or representative_point(geometry), footprint
+
+
+def parse_power(payload: dict[str, Any], provider: str, source_key: str, lgas: dict[str, Any]) -> list[dict[str, Any]]:
+    if payload.get("type") != "FeatureCollection":
+        raise RuntimeError("Power source is not a GeoJSON FeatureCollection")
+    incidents = []
+    for feature in payload.get("features", []):
+        props = feature.get("properties") or {}
+        outage_type = clean(property_value(props, "TYPE", "OUTAGE_TYPE"))
+        if outage_type and "unplanned" not in norm(outage_type):
+            continue
+        event_id = clean(property_value(props, "EVENT_ID", "ID")) or stable_id(provider, props, feature.get("geometry"))
+        customers = parse_int(property_value(props, "CUSTOMERS_AFFECTED", "CUSTOMERS", "CUSTOMER_COUNT"))
+        suburbs = clean(property_value(props, "SUBURBS", "SUBURB", "LOCALITIES", "LOCALITY"))
+        locality = title_case(re.split(r"[,;/]", suburbs)[0]) if suburbs else "Queensland"
+        coords, footprint = power_geometry(feature.get("geometry"))
+        lga = locate_lga(coords, lgas)
+        reason = clean(property_value(props, "REASON", "CAUSE"))
+        streets = clean(property_value(props, "STREETS"))
+        description = ". ".join(part for part in (reason, f"Affected streets: {streets}" if streets else "") if part)
+        incidents.append({
+            "id": f"power-{source_key}-{norm(event_id).replace(' ', '-')}",
+            "sector": "power",
+            "subtype": "unplanned",
+            "title": f"{locality} unplanned power outage",
+            "description": description,
+            "status": clean(property_value(props, "STATUS")) or "Outage reported",
+            "lga": lga,
+            "locality": title_case(suburbs),
+            "coordinates": coords,
+            "geometry": footprint,
+            "customers": customers,
+            "planned": False,
             "updated": NOW_ISO,
-            "source_name": "Maritime Safety Queensland",
-            "source_url": SOURCES["marine"]["url"],
+            "estimated_restore": iso(property_value(props, "EST_FIX_TIME", "ESTIMATED_RESTORATION", "ETR")) or clean(property_value(props, "EST_FIX_TIME", "ESTIMATED_RESTORATION", "ETR")),
+            "source_name": provider,
+            "source_url": SOURCES[source_key]["url"],
         })
     return incidents
 
 
-'''
+def parse_school_sections(text: str) -> list[tuple[str, str]]:
+    headings = {"state school closures": "State", "independent school closures": "Independent", "catholic school closures": "Catholic"}
+    sector = None
+    result = []
+    for raw in text.splitlines():
+        line = clean(raw)
+        key = norm(line)
+        if key in headings:
+            sector = headings[key]
+            continue
+        if key.startswith("early childhood"):
+            sector = None
+        if not sector or "there are no current closures" in key:
+            continue
+        if line.lstrip().startswith(("*", "•", "-")):
+            item = clean(line.lstrip("*•- "))
+            if item:
+                result.append((sector, item))
+    return result
 
 
-INDEX_CSS_BLOCK = r'''    /* Marine Warnings KPI v1 */
-    .focus-lga-kpi{
-      flex:0 0 auto;display:flex;align-items:center;gap:9px;min-width:112px;
-      padding:7px 9px;border:1px solid rgba(165,140,242,.42);border-radius:10px;
-      background:rgba(165,140,242,.12);box-shadow:inset 3px 0 0 #a58cf2
+def school_name(line: str) -> str:
+    return clean(re.split(r"\s+[–—-]\s+(?:closed|closure|until|from|due|campus)", line, maxsplit=1, flags=re.I)[0])
+
+
+def school_directory(lgas: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    lookup: dict[str, list[dict[str, Any]]] = {}
+    for layer in SCHOOL_LAYERS:
+        payload = get_json(
+            f"{SCHOOL_MAPSERVER}/{layer}/query",
+            {"where": "1=1", "outFields": "*", "returnGeometry": "true", "outSR": "4326", "f": "geojson"},
+        )
+        for feature in payload.get("features", []):
+            props = {norm(key).replace(" ", "_"): value for key, value in (feature.get("properties") or {}).items()}
+            name = clean(props.get("centre_name") or props.get("school_name") or props.get("name") or props.get("facility_name"))
+            if not name:
+                continue
+            coords = representative_point(feature.get("geometry"))
+            sector_text = norm(props.get("school_sector") or props.get("sector") or props.get("non_state_sector") or props.get("authority"))
+            sector = "State" if layer != 9 else "Catholic" if "catholic" in sector_text else "Independent" if "independent" in sector_text else "Non-State"
+            lookup.setdefault(norm(name), []).append({
+                "name": name,
+                "coordinates": coords,
+                "lga": locate_lga(coords, lgas),
+                "locality": clean(props.get("locality") or props.get("suburb") or props.get("town") or props.get("physical_suburb")),
+                "sector": sector,
+            })
+    return lookup
+
+
+def parse_schools(text: str, lgas: dict[str, Any]) -> list[dict[str, Any]]:
+    closures = parse_school_sections(text)
+    if not closures:
+        return []
+    directory = school_directory(lgas)
+    incidents = []
+    for sector, raw_line in closures:
+        name = school_name(raw_line)
+        key = norm(name)
+        candidates = directory.get(key, [])
+        if not candidates:
+            match = difflib.get_close_matches(key, directory.keys(), n=1, cutoff=0.84)
+            candidates = directory.get(match[0], []) if match else []
+        matched = next((item for item in candidates if item["sector"] == sector or item["sector"] == "Non-State"), candidates[0] if candidates else None)
+        incidents.append({
+            "id": f"schools-{stable_id(sector, name)}",
+            "sector": "schools",
+            "subtype": "closure",
+            "title": name,
+            "description": raw_line,
+            "status": "Closed",
+            "lga": matched.get("lga") if matched else None,
+            "locality": matched.get("locality") if matched else None,
+            "coordinates": matched.get("coordinates") if matched else None,
+            "geometry": None,
+            "customers": 0,
+            "planned": False,
+            "updated": NOW_ISO,
+            "source_name": "Queensland Department of Education",
+            "source_url": "https://closures.qld.edu.au/",
+            "school_sector": sector,
+        })
+    return incidents
+
+
+def strip_html(value: str) -> str:
+    return clean(html.unescape(re.sub(r"<[^>]+>", " ", value or "")))
+
+
+def parse_rail(xml_data: bytes) -> list[dict[str, Any]]:
+    root = ET.fromstring(xml_data)
+    incidents = []
+    terms = ("closed", "closure", "suspended", "not running", "no trains", "replacement bus", "cancelled", "canceled", "major delay", "track work")
+    for item in root.findall(".//item"):
+        def value(tag: str) -> str:
+            element = item.find(tag)
+            return clean(element.text if element is not None else "")
+        title = value("title") or "Rail service update"
+        description = strip_html(value("description"))
+        combined = norm(f"{title} {description}")
+        if not any(term in combined for term in terms):
+            continue
+        closure = any(term in combined for term in ("closed", "closure", "suspended", "not running", "no trains"))
+        link = value("link") or SOURCES["rail"]["url"]
+        incidents.append({
+            "id": f"rail-{stable_id(title, link)}",
+            "sector": "rail",
+            "subtype": "closure" if closure else "disruption",
+            "title": title,
+            "description": description,
+            "status": "Closure / suspension" if closure else "Significant disruption",
+            "lga": None,
+            "locality": "Queensland rail network",
+            "coordinates": None,
+            "geometry": None,
+            "customers": 0,
+            "planned": "track work" in combined or "planned" in combined,
+            "updated": iso(value("pubDate")) or NOW_ISO,
+            "source_name": "Translink",
+            "source_url": link,
+        })
+    return incidents
+
+
+def read_embedded() -> dict[str, Any]:
+    text = INDEX.read_text(encoding="utf-8")
+    start, end = text.index(DATA_START) + len(DATA_START), text.index(DATA_END)
+    return json.loads(text[start:end].strip())
+
+
+def write_embedded(data: dict[str, Any]) -> None:
+    text = INDEX.read_text(encoding="utf-8")
+    start, end = text.index(DATA_START) + len(DATA_START), text.index(DATA_END)
+    compact = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    INDEX.write_text(text[:start] + compact + text[end:], encoding="utf-8")
+
+
+def source_result(name: str, status: str, count: int, error: str | None = None) -> dict[str, Any]:
+    return {
+        "name": SOURCES[name]["name"],
+        "url": SOURCES[name]["url"],
+        "status": status,
+        "count": count,
+        "retrieved_at": NOW_ISO,
+        "error": clean(error)[:300] if error else None,
     }
-    .focus-lga-kpi-label{color:#cbbdfb;font-size:9px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;line-height:1.15}
-    .focus-lga-kpi-value{color:#cbbdfb;font-size:22px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
-    html[data-theme="light"] .focus-lga-kpi{background:rgba(112,83,205,.08);border-color:rgba(112,83,205,.3)}
-    html[data-theme="light"] .focus-lga-kpi-label,html[data-theme="light"] .focus-lga-kpi-value{color:#6749b8}
-'''
-
-MARINE_CARD = '''        <article class="metric" style="--tone:var(--marine)" data-kpi-sector="marine" role="button" tabindex="0" aria-label="Toggle marine warnings">
-          <div class="metric-label">Marine warnings</div>
-          <div class="metric-value" id="marineValue">—</div>
-          <div class="metric-detail" id="marineDetail">MSQ status pending</div>
-        </article>
-'''
-
-LGA_BADGE = '''          <div class="focus-lga-kpi" title="Queensland LGAs affected within the current filters" aria-label="LGAs affected within current filters">
-            <span class="focus-lga-kpi-label">LGAs<br>affected</span>
-            <strong class="focus-lga-kpi-value" id="lgaValue">0</strong>
-          </div>
-'''
-
-
-TOP_LGA_CARD_PATTERN = re.compile(
-    r'''        <article class="metric" style="--tone:#a58cf2" data-kpi-sector="all"[^>]*>\s*'''
-    r'''<div class="metric-label">LGAs affected</div>\s*'''
-    r'''<div class="metric-value" id="lgaValue">0</div>\s*'''
-    r'''<div class="metric-detail">within current filters</div>\s*'''
-    r'''</article>\s*''',
-    re.S,
-)
-
-
-def replace_once(text: str, old: str, new: str, label: str) -> str:
-    count = text.count(old)
-    if count != 1:
-        raise RuntimeError(f"Marine KPI patch expected exactly one {label}; found {count}.")
-    return text.replace(old, new, 1)
-
-
-def patch_refresh(text: str) -> tuple[str, bool]:
-    if REFRESH_MARKER in text:
-        validate_refresh(text)
-        return text, False
-
-    if 'from html.parser import HTMLParser' not in text:
-        text = replace_once(
-            text,
-            "import html\n",
-            "import html\nfrom html.parser import HTMLParser\n",
-            "html import anchor",
-        )
-
-    if '"marine": {' not in text:
-        geography_anchor = '    "geography": {\n'
-        marine_source = (
-            '    "marine": {\n'
-            '        "name": "Maritime Safety Queensland",\n'
-            f'        "url": "{MSQ_URL}",\n'
-            '    },\n'
-        )
-        text = replace_once(
-            text,
-            geography_anchor,
-            marine_source + geography_anchor,
-            "SOURCES geography anchor",
-        )
-
-    text = replace_once(
-        text,
-        "\ndef read_embedded() -> dict[str, Any]:\n",
-        "\n" + MARINE_PARSER_BLOCK + "def read_embedded() -> dict[str, Any]:\n",
-        "read_embedded anchor",
-    )
-
-    rail_job = '        ("rail", lambda: parse_rail(get_bytes(SOURCES["rail"]["url"]))),\n'
-    marine_job = '        ("marine", lambda: parse_msq_marine_warnings(get_bytes(SOURCES["marine"]["url"]))),\n'
-    text = replace_once(text, rail_job, rail_job + marine_job, "rail job anchor")
-
-    validate_refresh(text)
-    return text, True
-
-
-def validate_refresh(text: str) -> None:
-    required = (
-        REFRESH_MARKER,
-        '"marine": {',
-        '"name": "Maritime Safety Queensland"',
-        f'"url": "{MSQ_URL}"',
-        'def parse_msq_marine_warnings(html_data: bytes)',
-        '"sector": "marine"',
-        '("marine", lambda: parse_msq_marine_warnings(get_bytes(SOURCES["marine"]["url"]))),',
-        'raise RuntimeError("Unable to verify the active maritime-warning state from the MSQ dashboard")',
-    )
-    for token in required:
-        if token not in text:
-            raise RuntimeError(f"Marine refresh patch validation failed: missing {token!r}.")
-    compile(text, str(REFRESH), "exec")
-
-
-def patch_index(text: str) -> tuple[str, bool]:
-    if INDEX_MARKER in text:
-        validate_index(text)
-        return text, False
-
-    # Add a distinct marine sector colour while keeping the five-card KPI grid.
-    text = replace_once(
-        text,
-        "      --schools-soft:rgba(72,199,142,.13);\n",
-        "      --schools-soft:rgba(72,199,142,.13);\n"
-        "      --marine:#35c6bb;\n"
-        "      --marine-soft:rgba(53,198,187,.14);\n",
-        "schools colour variables",
-    )
-
-    css_anchor = "    .metric-detail{margin-top:4px;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\n"
-    text = replace_once(text, css_anchor, css_anchor + "\n" + INDEX_CSS_BLOCK, "metric-detail CSS anchor")
-
-    text, count = TOP_LGA_CARD_PATTERN.subn(MARINE_CARD, text, count=1)
-    if count != 1:
-        raise RuntimeError(f"Marine KPI patch expected one top-row LGAs affected card; found {count}.")
-
-    focus_anchor = '''            <div class="panel-subtitle">Filter active disruptions by location, sector, or search term</div>
-          </div>
-        </div>
-        <div class="filter-body">
-'''
-    focus_replacement = '''            <div class="panel-subtitle">Filter active disruptions by location, sector, or search term</div>
-          </div>
-''' + LGA_BADGE + '''        </div>
-        <div class="filter-body">
-'''
-    text = replace_once(text, focus_anchor, focus_replacement, "Operational focus header")
-
-    sectors_anchor = "      schools: {label:'Schools', symbol:'S', colour:'#48c78e', soft:'rgba(72,199,142,.14)'}\n"
-    sectors_replacement = (
-        "      schools: {label:'Schools', symbol:'S', colour:'#48c78e', soft:'rgba(72,199,142,.14)'},\n"
-        "      marine: {label:'Marine', symbol:'M', colour:'#35c6bb', soft:'rgba(53,198,187,.14)'}\n"
-    )
-    text = replace_once(text, sectors_anchor, sectors_replacement, "SECTORS schools entry")
-
-    source_anchor = "      schools:'https://closures.qld.edu.au/'\n"
-    source_replacement = (
-        "      schools:'https://closures.qld.edu.au/',\n"
-        f"      marine:'{MSQ_URL}'\n"
-    )
-    text = replace_once(text, source_anchor, source_replacement, "official source schools entry")
-
-    summary_anchor = "      const nonStateSchools = schools.filter(i => String(i.school_sector || '').toLowerCase() !== 'state');\n"
-    summary_insert = summary_anchor + (
-        "      const marine = context.filter(i => i.sector === 'marine');\n"
-        "      const marineSource = DASHBOARD_DATA.sources?.marine || {};\n"
-    )
-    text = replace_once(text, summary_anchor, summary_insert, "renderSummary school calculation")
-
-    school_dom_anchor = "      document.getElementById('schoolDetail').textContent = `${fmt(stateSchools.length)} state · ${fmt(nonStateSchools.length)} non-state`;\n"
-    marine_dom = school_dom_anchor + (
-        "      const marineValue = document.getElementById('marineValue');\n"
-        "      const marineDetail = document.getElementById('marineDetail');\n"
-        "      const marineVerified = marineSource.status === 'current' || marineSource.status === 'fallback';\n"
-        "      marineValue.textContent = marineVerified ? fmt(marine.length) : '—';\n"
-        "      marineDetail.textContent = marineSource.status === 'fallback'\n"
-        "        ? 'cached MSQ snapshot'\n"
-        "        : marineSource.status === 'current'\n"
-        "          ? `${fmt(marine.length)} active warning${marine.length === 1 ? '' : 's'}`\n"
-        "          : 'MSQ unavailable';\n"
-    )
-    text = replace_once(text, school_dom_anchor, marine_dom, "renderSummary school DOM update")
-
-    validate_index(text)
-    return text, True
-
-
-def validate_index(text: str) -> None:
-    required = (
-        INDEX_MARKER,
-        '--marine:#35c6bb;',
-        'data-kpi-sector="marine"',
-        'id="marineValue"',
-        'id="marineDetail"',
-        'class="focus-lga-kpi"',
-        'id="lgaValue"',
-        "marine: {label:'Marine'",
-        f"marine:'{MSQ_URL}'",
-        "const marineSource = DASHBOARD_DATA.sources?.marine || {};",
-        "'MSQ unavailable'",
-    )
-    for token in required:
-        if token not in text:
-            raise RuntimeError(f"Marine index patch validation failed: missing {token!r}.")
-
-    if text.count('id="marineValue"') != 1:
-        raise RuntimeError("Marine index patch validation failed: marineValue must occur exactly once.")
-    if text.count('id="lgaValue"') != 1:
-        raise RuntimeError("Marine index patch validation failed: lgaValue must occur exactly once.")
-    if re.search(r'<article[^>]+data-kpi-sector="all"', text):
-        raise RuntimeError("Marine index patch validation failed: old all-sectors LGA KPI card remains.")
 
 
 def main() -> int:
-    if not REFRESH.exists() or not INDEX.exists():
-        missing = [path.name for path in (REFRESH, INDEX) if not path.exists()]
-        raise SystemExit(f"Missing required dashboard file(s): {', '.join(missing)}")
+    if not INDEX.exists():
+        print("index.html was not found beside refresh.py", file=sys.stderr)
+        return 1
+    previous = read_embedded()
+    previous_incidents = previous.get("incidents", [])
+    previous_by_source = {
+        key: [item for item in previous_incidents if item.get("source_key") == key]
+        for key in SOURCES
+    }
+    sources: dict[str, Any] = {}
 
-    refresh_original = REFRESH.read_text(encoding="utf-8")
-    index_original = INDEX.read_text(encoding="utf-8")
-
-    try:
-        refresh_patched, refresh_changed = patch_refresh(refresh_original)
-        index_patched, index_changed = patch_index(index_original)
-    except Exception as exc:
-        raise SystemExit(f"Marine KPI patch aborted without writing files: {exc}") from exc
-
-    # Write only after both files validate, so a failed index patch cannot leave
-    # refresh.py half-updated (and vice versa).
-    if refresh_changed:
-        REFRESH.write_text(refresh_patched, encoding="utf-8")
-    if index_changed:
-        INDEX.write_text(index_patched, encoding="utf-8")
-
-    if refresh_changed or index_changed:
-        print("Applied Marine Warnings KPI: MSQ source, Marine sector, and Operational Focus LGA badge.")
+    # LGA boundaries change rarely. Reuse the last embedded copy so the
+    # 15-minute refresh only downloads them on the first successful run.
+    lgas = previous.get("lgas") or {"type": "FeatureCollection", "features": []}
+    if lgas.get("features"):
+        sources["geography"] = source_result("geography", "current", len(lgas.get("features", [])))
     else:
-        print("Marine Warnings KPI is already applied; no changes required.")
+        try:
+            lgas = fetch_lgas()
+            sources["geography"] = source_result("geography", "current", len(lgas.get("features", [])))
+        except Exception as exc:  # noqa: BLE001
+            sources["geography"] = source_result("geography", "error", 0, str(exc))
+
+    incidents: list[dict[str, Any]] = []
+
+    jobs = [
+        ("qldtraffic", lambda: parse_roads(get_json(SOURCES["qldtraffic"]["url"]), lgas)),
+        ("energex", lambda: parse_power(get_json(SOURCES["energex"]["url"], POWER_ARCGIS_PARAMS), "Energex", "energex", lgas)),
+        ("ergon", lambda: parse_power(get_json(SOURCES["ergon"]["url"], POWER_ARCGIS_PARAMS), "Ergon Energy", "ergon", lgas)),
+        ("schools", lambda: parse_schools(get_bytes(SOURCES["schools"]["url"]).decode("utf-8-sig"), lgas)),
+        ("rail", lambda: parse_rail(get_bytes(SOURCES["rail"]["url"]))),
+    ]
+
+    for key, job in jobs:
+        try:
+            records = job()
+            for record in records:
+                record["source_key"] = key
+            incidents.extend(records)
+            sources[key] = source_result(key, "current", len(records))
+            print(f"{SOURCES[key]['name']}: {len(records)} records")
+        except Exception as exc:  # noqa: BLE001
+            fallback = (
+                qldtraffic_fallback_records(previous_by_source.get(key, []), lgas)
+                if key == "qldtraffic"
+                else previous_by_source.get(key, [])
+            )
+            incidents.extend(fallback)
+            sources[key] = source_result(key, "fallback" if fallback else "error", len(fallback), str(exc))
+            print(f"{SOURCES[key]['name']}: ERROR - {exc}")
+
+    data = {
+        "generated_at": NOW_ISO,
+        "notice": "Snapshot refreshed automatically by GitHub. Scheduled runs occur every 15 minutes; individual source publication times may differ.",
+        "incidents": incidents,
+        "lgas": lgas,
+        "sources": sources,
+    }
+    write_embedded(data)
+    print(f"Updated {INDEX.name}: {len(incidents)} total incidents")
     return 0
 
 
