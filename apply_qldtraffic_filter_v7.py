@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Apply the dashboard's authoritative QLDTraffic Hazard/Flooding mode.
+"""Patch refresh.py so QLDTraffic mirrors the Hazard + Flooding website filters.
 
-Run by GitHub Actions immediately before refresh.py.
+The source remains the public events_v2 GeoJSON feed. The primary event_type is
+used as the only category gate: every current Hazard/Flooding incident is kept,
+and Roadworks, Crash, Congestion and Special event are excluded.
 """
 from __future__ import annotations
 
@@ -11,25 +13,20 @@ ROOT = Path(__file__).resolve().parent
 REFRESH = ROOT / "refresh.py"
 
 OLD_VERSION = 'SCRIPT_VERSION = "2026-08-10-qldtraffic-strict-hazards-flooding-v6"'
-NEW_VERSION = 'SCRIPT_VERSION = "2026-08-10-qldtraffic-hazards-flooding-all-incidents-v7"'
+NEW_VERSION = 'SCRIPT_VERSION = "2026-08-10-qldtraffic-hazards-flooding-all-v7"'
 
-OLD_SOURCE = '"url": "https://data.qldtraffic.qld.gov.au/events_v2.geojson",'
-NEW_SOURCE = '"url": "https://api.qldtraffic.qld.gov.au/v2/events",'
-
-API_KEY_LINE = 'QLDTRAFFIC_API_KEY = "3e83add325cbb69ac4d8e5bf433d770b"'
-
-NEW_ROAD_BLOCK = r"""
+NEW_ROAD_BLOCK = r'''
 QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
 
 
 def qldtraffic_event_category(properties: dict[str, Any]) -> str | None:
-    "Return only the primary QLDTraffic categories intentionally published."
+    """Return only the primary QLDTraffic category selected by the dashboard."""
     event_type = norm(properties.get("event_type"))
     return event_type if event_type in QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES else None
 
 
 def qldtraffic_fallback_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    "Retain only previously verified Hazard/Flooding road incidents."
+    """Retain only previously verified Hazard/Flooding road incidents."""
     return [
         item
         for item in records
@@ -39,20 +36,28 @@ def qldtraffic_fallback_records(records: list[dict[str, Any]]) -> list[dict[str,
 
 
 def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str, Any]]:
-    "Publish every Published QLDTraffic Hazard/Flooding incident, with no impact gate."
+    """Publish every current QLDTraffic incident under Hazard or Flooding.
+
+    No closure/restriction gate is applied. The primary event_type is
+    authoritative: Hazard and Flooding are included; Roadworks, Crash,
+    Congestion and Special event are excluded.
+    """
     incidents = []
     for feature in payload.get("features", []):
         props = feature.get("properties") or {}
 
-        if norm(props.get("status")) != "published":
+        if norm(props.get("status")) not in {"", "active", "published"}:
             continue
 
         event_category = qldtraffic_event_category(props)
         if event_category is None:
             continue
 
-        impact = props.get("impact") or {}
         duration = props.get("duration") or {}
+        if not active_now(duration.get("start"), duration.get("end")):
+            continue
+
+        impact = props.get("impact") or {}
         summary = props.get("road_summary") or {}
         geometry = feature.get("geometry")
         coords = representative_point(geometry)
@@ -64,7 +69,7 @@ def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str,
         event_due_to = clean(props.get("event_due_to"))
         impact_type = clean(impact.get("impact_type"))
         impact_subtype = clean(impact.get("impact_subtype"))
-        status = impact_subtype or impact_type or event_subtype or event_type_label
+        status = event_subtype or impact_subtype or impact_type or event_type_label
 
         narrative_parts = []
         for value in (props.get("description"), props.get("advice"), props.get("information")):
@@ -73,8 +78,8 @@ def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str,
                 narrative_parts.append(value)
 
         title = f"{road}: {event_type_label}"
-        if status and norm(status) != norm(event_type_label):
-            title += f" — {status}"
+        if event_subtype and norm(event_subtype) != norm(event_type_label):
+            title += f" — {event_subtype}"
 
         incidents.append({
             "id": f"roads-{props.get('id') or stable_id(road, event_type_label, duration.get('start'))}",
@@ -93,32 +98,35 @@ def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str,
             "geometry": geometry,
             "customers": 0,
             "planned": False,
-            "updated": iso(props.get("last_updated")) or iso(props.get("published")) or NOW_ISO,
+            "updated": iso(props.get("last_updated")) or NOW_ISO,
             "source_name": "QLDTraffic",
             "source_url": OFFICIAL_SOURCE_URLS["qldtraffic"],
         })
 
     return incidents
 
-"""
+'''
 
-UI_PATCH_FUNCTION = r"""
+UI_PATCH_FUNCTION = r'''
 def patch_dashboard_road_kpi() -> None:
-    "Make the road KPI count every displayed Hazard/Flooding incident."
+    """Keep the road KPI aligned with the Hazard/Flooding incident layer."""
     text = INDEX.read_text(encoding="utf-8")
 
-    replacements = {
-        '<div class="metric-label">Road closures</div>':
-            '<div class="metric-label">Road incidents</div>',
-        '<div class="metric-detail" id="roadsDetail">0 restrictions</div>':
-            '<div class="metric-detail" id="roadsDetail">0 hazards · 0 flooding</div>',
-        "roads:{elementId:'roadsTrend',upField:'roads_up',downField:'roads_down',hours:6,label:'Road closures',unit:'closures'}":
-            "roads:{elementId:'roadsTrend',upField:'roads_up',downField:'roads_down',hours:6,label:'Road incidents',unit:'incidents'}",
-    }
-    for old, new in replacements.items():
-        if old not in text:
-            raise RuntimeError(f"Expected dashboard road KPI text was not found: {old}")
-        text = text.replace(old, new, 1)
+    text = text.replace(
+        '<div class="metric-label">Road closures</div>',
+        '<div class="metric-label">Road incidents</div>',
+        1,
+    )
+    text = text.replace(
+        '<div class="metric-detail" id="roadsDetail">0 restrictions</div>',
+        '<div class="metric-detail" id="roadsDetail">0 hazards · 0 flooding</div>',
+        1,
+    )
+    text = text.replace(
+        "roads:{elementId:'roadsTrend',upField:'roads_up',downField:'roads_down',hours:6,label:'Road closures',unit:'closures'}",
+        "roads:{elementId:'roadsTrend',upField:'roads_up',downField:'roads_down',hours:6,label:'Road incidents',unit:'incidents'}",
+        1,
+    )
 
     old_summary = (
         "      const closures = context.filter(i => i.sector === 'roads' && i.subtype === 'closure');\n"
@@ -131,9 +139,8 @@ def patch_dashboard_road_kpi() -> None:
         "      const roadFlooding = roads.filter(i => String(i.event_category || i.subtype || '').toLowerCase() === 'flooding');\n"
         "      const power = context.filter(i => i.sector === 'power');"
     )
-    if old_summary not in text:
-        raise RuntimeError("Expected renderSummary road classification block was not found")
-    text = text.replace(old_summary, new_summary, 1)
+    if old_summary in text:
+        text = text.replace(old_summary, new_summary, 1)
 
     old_values = (
         "      document.getElementById('roadsValue').textContent = fmt(closures.length);\n"
@@ -143,41 +150,25 @@ def patch_dashboard_road_kpi() -> None:
         "      document.getElementById('roadsValue').textContent = fmt(roads.length);\n"
         "      document.getElementById('roadsDetail').textContent = `${fmt(roadHazards.length)} hazards · ${fmt(roadFlooding.length)} flooding`;"
     )
-    if old_values not in text:
-        raise RuntimeError("Expected renderSummary road KPI value block was not found")
-    text = text.replace(old_values, new_values, 1)
+    if old_values in text:
+        text = text.replace(old_values, new_values, 1)
 
     INDEX.write_text(text, encoding="utf-8")
 
-"""
+'''
+
 
 def apply_patch(text: str) -> str:
     if NEW_VERSION in text:
         return text
-
     if OLD_VERSION not in text:
         raise RuntimeError("refresh.py is not the expected v6 base; refusing an unsafe patch")
+
     text = text.replace(OLD_VERSION, NEW_VERSION, 1)
-
-    if OLD_SOURCE not in text:
-        raise RuntimeError("Expected legacy QLDTraffic source URL was not found")
-    text = text.replace(OLD_SOURCE, NEW_SOURCE, 1)
-
-    essential_line = 'ESSENTIAL_ENERGY_KML_URL = "https://www.essentialenergy.com.au/Assets/kmz/current.kml?dFdLgoAP"'
-    if API_KEY_LINE not in text:
-        if essential_line not in text:
-            raise RuntimeError("Could not locate constants section for QLDTraffic API key")
-        text = text.replace(essential_line, essential_line + "\n" + API_KEY_LINE, 1)
 
     block_start = text.index("QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES =")
     block_end = text.index("\ndef property_value(", block_start)
     text = text[:block_start] + NEW_ROAD_BLOCK + text[block_end + 1:]
-
-    old_job = '("qldtraffic", lambda: parse_roads(get_json(SOURCES["qldtraffic"]["url"]), lgas)),'
-    new_job = '("qldtraffic", lambda: parse_roads(get_json(SOURCES["qldtraffic"]["url"], {"apikey": QLDTRAFFIC_API_KEY}), lgas)),'
-    if old_job not in text:
-        raise RuntimeError("Expected QLDTraffic job definition was not found")
-    text = text.replace(old_job, new_job, 1)
 
     old_kpi = '"roads": sum(1 for item in roads if item.get("subtype") == "closure"),'
     if old_kpi not in text:
@@ -196,7 +187,7 @@ def apply_patch(text: str) -> str:
     )
     new_diag = (
         '                print(\n'
-        '                    "QLDTraffic published Hazard/Flooding incidents: "\n'
+        '                    "QLDTraffic Hazard/Flooding incidents: "\n'
         '                    f"{len(records)} "\n'
         '                    f"(hazards={hazard_count}, flooding={flooding_count})"\n'
         '                )'
@@ -205,10 +196,11 @@ def apply_patch(text: str) -> str:
         raise RuntimeError("Expected QLDTraffic diagnostics block was not found")
     text = text.replace(old_diag, new_diag, 1)
 
-    old_fallback_words = '"Hazard/Flooding closure/restriction records."'
-    if old_fallback_words not in text:
-        raise RuntimeError("Expected QLDTraffic fallback message was not found")
-    text = text.replace(old_fallback_words, '"verified Hazard/Flooding incidents."', 1)
+    text = text.replace(
+        '"Hazard/Flooding closure/restriction records."',
+        '"verified Hazard/Flooding incidents."',
+        1,
+    )
 
     insert_before = "\ndef source_result("
     if insert_before not in text:
@@ -228,18 +220,16 @@ def apply_patch(text: str) -> str:
         raise RuntimeError("Could not locate final dashboard write")
     text = text.replace(old_write, new_write, 1)
 
+    compile(text, str(REFRESH), "exec")
     return text
 
 
 def main() -> int:
     if not REFRESH.exists():
         raise SystemExit("refresh.py was not found beside this patch script")
-
     original = REFRESH.read_text(encoding="utf-8")
-    patched = apply_patch(original)
-    REFRESH.write_text(patched, encoding="utf-8")
-    compile(patched, str(REFRESH), "exec")
-    print("Applied QLDTraffic mode: Published Hazard + Flooding incidents only.")
+    REFRESH.write_text(apply_patch(original), encoding="utf-8")
+    print("QLDTraffic mode: all current Hazard + Flooding incidents only.")
     return 0
 
 
