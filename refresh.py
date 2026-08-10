@@ -343,6 +343,7 @@ def fetch_lgas() -> dict[str, Any]:
 
 
 
+
 # QLDTraffic filter: Hazard + Flooding only
 # Queensland-only road geography filter
 QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
@@ -854,7 +855,8 @@ def _msq_unique_candidates(values: list[str]) -> list[str]:
 
 
 
-# Marine map locations v3
+
+# Marine map locations v4
 # Coordinate order throughout the dashboard is GeoJSON order: [longitude, latitude].
 MSQ_QLD_BOUNDS = {
     "min_lon": 137.8,
@@ -994,15 +996,66 @@ def _msq_warning_location(value: str, lgas: dict[str, Any]) -> tuple[list[float]
         return point, lga or "Queensland LGA", lga, "lga"
     return list(MSQ_STATEWIDE_POINT), "Queensland maritime network (source location not specified)", None, "statewide"
 
+def _msq_warning_parts(value: str) -> tuple[str | None, str | None, str | None]:
+    # Extract alert phase, warning level and operational direction from an MSQ title.
+    title = clean(value)
+    parts = [clean(part) for part in re.split(r"\s+(?:-|–|—)\s+", title) if clean(part)]
+    if not parts:
+        return None, None, None
+
+    alert_phase = next((part for part in parts if "alert" in norm(part)), None)
+    warning_level = next((
+        part for part in parts
+        if any(term in norm(part) for term in ("emergency warning", "watch and act", "advice", "warning"))
+        and part != alert_phase
+    ), None)
+    action = next((part for part in reversed(parts) if part not in {alert_phase, warning_level}), None)
+    return alert_phase, warning_level, action
+
+
+def _msq_warning_detail(title: str, values: list[str]) -> str:
+    # Keep a richer source string when the dashboard exposes one for the same warning.
+    title_text = clean(title)
+    title_key = norm(title_text)
+    if not title_key:
+        return ""
+
+    best = ""
+    for value in values:
+        candidate = clean(html.unescape(str(value or "")))
+        candidate = clean(
+            candidate.replace(r"\n", " ")
+            .replace(r"\r", " ")
+            .replace(r"\t", " ")
+            .replace(r'\"', '"')
+        )
+        candidate_key = norm(candidate)
+        if not candidate_key or candidate_key == title_key:
+            continue
+        if title_key not in candidate_key:
+            continue
+        if len(candidate) <= len(title_text) + 8 or len(candidate) > 1200:
+            continue
+        if len(candidate) > len(best):
+            best = candidate
+
+    if not best:
+        return ""
+
+    # Avoid repeating the title when a dashboard payload is "title - details".
+    if best.lower().startswith(title_text.lower()):
+        remainder = clean(best[len(title_text):].lstrip(" -:|–—"))
+        if remainder:
+            best = remainder
+    return best[:1200]
+
+
 def msq_marine_fallback_records(records: list[dict[str, Any]], lgas: dict[str, Any]) -> list[dict[str, Any]]:
-    # Upgrade cached Marine records so fallback warnings also appear on the map.
+    # Upgrade cached Marine records so fallback warnings retain rich display data and map cleanly.
     enriched: list[dict[str, Any]] = []
     for item in records:
         record = dict(item)
         if record.get("sector") != "marine":
-            enriched.append(record)
-            continue
-        if _msq_point_in_qld(record.get("coordinates")):
             enriched.append(record)
             continue
 
@@ -1011,19 +1064,28 @@ def msq_marine_fallback_records(records: list[dict[str, Any]], lgas: dict[str, A
             for field in ("title", "description", "locality")
             if clean(record.get(field))
         )
-        coordinates, locality, lga, location_precision = _msq_warning_location(warning_text, lgas)
-        record["coordinates"] = coordinates
-        record["geometry"] = record.get("geometry") or None
-        record["location_precision"] = location_precision
-        if not clean(record.get("locality")) or norm(record.get("locality")) == "queensland maritime network":
-            record["locality"] = locality
-        if not clean(record.get("lga")) and lga:
-            record["lga"] = lga
+        alert_phase, warning_level, action = _msq_warning_parts(clean(record.get("title")))
+        record["marine_alert_phase"] = record.get("marine_alert_phase") or alert_phase
+        record["marine_warning_level"] = record.get("marine_warning_level") or warning_level
+        record["marine_action"] = record.get("marine_action") or action
+
+        if not _msq_point_in_qld(record.get("coordinates")):
+            coordinates, locality, lga, location_precision = _msq_warning_location(warning_text, lgas)
+            record["coordinates"] = coordinates
+            record["geometry"] = record.get("geometry") or None
+            record["location_precision"] = location_precision
+            if not clean(record.get("locality")) or norm(record.get("locality")) == "queensland maritime network":
+                record["locality"] = locality
+            if not clean(record.get("lga")) and lga:
+                record["lga"] = lga
+        else:
+            record["location_precision"] = record.get("location_precision") or "exact"
         enriched.append(record)
     return enriched
 
+
 def parse_msq_marine_warnings(html_data: bytes, lgas: dict[str, Any]) -> list[dict[str, Any]]:
-    # Parse active MSQ warnings and attach a mappable Queensland location.
+    # Parse active MSQ warnings, retain richer source text where exposed, and attach a map location.
     raw = html_data.decode("utf-8-sig", errors="replace")
     if not clean(raw):
         raise RuntimeError("MSQ dashboard returned an empty response")
@@ -1033,12 +1095,15 @@ def parse_msq_marine_warnings(html_data: bytes, lgas: dict[str, Any]) -> list[di
     visible_key = norm(" ".join(visible_lines))
     if any(phrase in visible_key for phrase in MSQ_NO_WARNING_PHRASES):
         return []
+
     script_strings = []
     for match in re.finditer(r"[\"']([^\"'\r\n]{12,500})[\"']", raw):
         value = match.group(1)
         if "warning" in value.lower() or "alert" in value.lower() or "closed" in value.lower():
             script_strings.append(value.replace(r"\u0026", "&").replace(r"\/", "/"))
-    warnings = _msq_unique_candidates(visible_lines + script_strings)
+
+    source_values = visible_lines + script_strings
+    warnings = _msq_unique_candidates(source_values)
     if not warnings:
         shell_key = norm(raw)
         if "maritime safety queensland" in shell_key or "powered by qit plus" in shell_key:
@@ -1047,11 +1112,14 @@ def parse_msq_marine_warnings(html_data: bytes, lgas: dict[str, Any]) -> list[di
                 "was not present in the server response"
             )
         raise RuntimeError("Unable to verify the active maritime-warning state from the MSQ dashboard")
+
     incidents = []
     for warning in warnings:
         title = warning if len(warning) <= 170 else warning[:167].rstrip() + "…"
-        description = "" if title == warning else warning
-        coordinates, locality, lga, location_precision = _msq_warning_location(warning, lgas)
+        source_detail = _msq_warning_detail(warning, source_values)
+        description = source_detail or ("" if title == warning else warning)
+        alert_phase, warning_level, action = _msq_warning_parts(warning)
+        coordinates, locality, lga, location_precision = _msq_warning_location(warning + " " + description, lgas)
         incidents.append({
             "id": f"marine-{stable_id(warning)}",
             "sector": "marine",
@@ -1060,6 +1128,9 @@ def parse_msq_marine_warnings(html_data: bytes, lgas: dict[str, Any]) -> list[di
             "title": title,
             "description": description,
             "status": "Active maritime warning",
+            "marine_alert_phase": alert_phase,
+            "marine_warning_level": warning_level,
+            "marine_action": action,
             "lga": lga,
             "locality": locality,
             "coordinates": coordinates,
