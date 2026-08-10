@@ -6,6 +6,7 @@ on:
     paths:
       - index.html
       - refresh.py
+      - apply_marine_kpi.py
       - requirements.txt
       - .github/workflows/update.yml
   schedule:
@@ -337,6 +338,13 @@ jobs:
 
           repair_refresh
           python /tmp/apply_qldtraffic_filter.py
+          python -m py_compile refresh.py
+
+      - name: Apply Marine Warnings KPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python apply_marine_kpi.py
           python -m py_compile refresh.py
 
       - name: Refresh live feeds
@@ -758,6 +766,7 @@ jobs:
 
             repair_refresh
             python /tmp/apply_qldtraffic_filter.py
+            python apply_marine_kpi.py
             python -m py_compile refresh.py
             python refresh.py
             python /tmp/apply_multi_lga.py
