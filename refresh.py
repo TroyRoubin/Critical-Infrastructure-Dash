@@ -26,22 +26,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover - Python 3.8 fallback
-    ZoneInfo = None  # type: ignore[assignment]
-
-SCRIPT_VERSION = "2026-08-10-qldtraffic-strict-hazards-flooding-v6"
-
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "index.html"
 AEST = timezone(timedelta(hours=10))
-ESSENTIAL_TZ = ZoneInfo("Australia/Sydney") if ZoneInfo is not None else AEST
 NOW = datetime.now(AEST)
 NOW_ISO = NOW.isoformat(timespec="seconds")
-
-# Exact working Essential Energy KML feed used by the supplied ZIP pipeline.
-ESSENTIAL_ENERGY_KML_URL = "https://www.essentialenergy.com.au/Assets/kmz/current.kml?dFdLgoAP"
 
 SOURCES = {
     "qldtraffic": {
@@ -55,10 +44,6 @@ SOURCES = {
     "ergon": {
         "name": "Ergon Energy",
         "url": "https://services.arcgis.com/33eHbTVqo7gtiCE8/arcgis/rest/services/VwErgonOutages/FeatureServer/0/query",
-    },
-    "essential": {
-        "name": "Essential Energy",
-        "url": ESSENTIAL_ENERGY_KML_URL,
     },
     "schools": {
         "name": "Queensland school closures",
@@ -85,25 +70,6 @@ POWER_ARCGIS_PARAMS = {
     "outSR": "4326",
     "f": "geojson",
 }
-
-# Human-readable public pages used by incident hyperlinks. Feed/API URLs remain
-# in SOURCES for retrieval and source-health reporting only.
-OFFICIAL_SOURCE_URLS = {
-    "qldtraffic": "https://qldtraffic.qld.gov.au/?tab=incident",
-    "energex": "https://www.energex.com.au/outages/outage-finder/emergency-outages-text-view/",
-    "ergon": "https://www.ergon.com.au/network/outages/outage-finder/outage-finder-text-view",
-    "essential": "https://www.essentialenergy.com.au/outages-and-faults/power-outages",
-    "schools": "https://closures.qld.edu.au/",
-}
-
-# KPI history is embedded beside the current snapshot so GitHub Pages remains
-# self-contained. At a 15-minute refresh cadence, seven days is about 672 small
-# records and adds only a modest amount to index.html.
-HISTORY_RETENTION = timedelta(days=7)
-HISTORY_MIN_SPACING = timedelta(minutes=10)
-HISTORY_MAX_POINTS = 700
-CHANGE_HISTORY_VERSION = 4
-LGA_ALIASES = {"Moreton Bay Regional": "City of Moreton Bay"}
 
 
 def clean(value: Any) -> str:
@@ -207,36 +173,6 @@ def get_bytes(url: str, params: dict[str, Any] | None = None, timeout: int = 30)
     if is_energy_qld and "403" in str(last_error):
         hint = " (Energy Queensland blocked the GitHub runner despite browser headers)"
     raise RuntimeError(f"Unable to retrieve {url}: {last_error}{hint}")
-
-
-def get_essential_kml(url: str = ESSENTIAL_ENERGY_KML_URL, timeout: int = 30) -> bytes:
-    """Retrieve Essential Energy's live KML using the working ZIP's headers."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/vnd.google-earth.kml+xml, application/xml, text/xml, */*",
-        "Accept-Language": "en-AU,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Referer": "https://www.essentialenergy.com.au/",
-    }
-    last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
-                payload = response.read()
-            if b"<kml" not in payload[:5000].lower() and b"<placemark" not in payload.lower():
-                raise RuntimeError("Essential Energy response was not KML")
-            return payload
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-    raise RuntimeError(f"Unable to retrieve Essential Energy KML: {last_error}")
 
 
 def get_json(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -399,96 +335,33 @@ def fetch_lgas() -> dict[str, Any]:
     return {"type": "FeatureCollection", "features": features}
 
 
-QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
-
-
-def qldtraffic_event_category(properties: dict[str, Any]) -> str | None:
-    """Return the only QLDTraffic current-alert categories used by this dashboard.
-
-    QLDTraffic's full feed also contains crashes, congestion, roadworks and
-    special events. Those categories are intentionally excluded.
-    """
-    event_type = norm(properties.get("event_type"))
-    if event_type.startswith("hazard"):
-        return "hazard"
-    if event_type.startswith("flood"):
-        return "flooding"
-    return None
-
-
-def qldtraffic_access_subtype(impact: dict[str, Any]) -> str | None:
-    """Classify only closures and genuine access restrictions."""
-    combined = norm(f"{impact.get('impact_type')} {impact.get('impact_subtype')}")
-    if re.search(r"\b(?:closure|closed)\b", combined):
-        return "closure"
-    if (
-        re.search(r"\b(?:restriction|restricted)\b", combined)
-        or "high clearance" in combined
-        or "four wheel drive" in combined
-        or re.search(r"\b4wd\b", combined)
-        or "load limit" in combined
-        or re.search(r"\bgvm\b", combined)
-        or "axle group" in combined
-        or re.search(r"\blane\b", combined)
-    ):
-        return "restriction"
-    return None
-
-
-def qldtraffic_fallback_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep only road records previously validated by the strict v6 parser.
-
-    Pre-v6 road records do not contain ``event_category``. Reusing those after
-    a feed failure can resurrect roadworks, crashes, congestion or special
-    events that are no longer permitted. Untagged legacy road records are
-    therefore deliberately discarded rather than displayed as misleading data.
-    """
-    return [
-        item
-        for item in records
-        if item.get("sector") == "roads"
-        and norm(item.get("event_category")) in QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES
-        and item.get("subtype") in {"closure", "restriction"}
-    ]
-
-
 def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str, Any]]:
     incidents = []
     for feature in payload.get("features", []):
         props = feature.get("properties") or {}
-
         if norm(props.get("status")) not in {"", "active", "published"}:
             continue
-
-        # CATEGORY GATE FIRST: a Roadworks/Crash/Congestion/Special Event
-        # closure must never enter merely because its impact says "road closed".
-        event_category = qldtraffic_event_category(props)
-        if event_category is None:
-            continue
-
         impact = props.get("impact") or {}
-        subtype = qldtraffic_access_subtype(impact)
-        if subtype is None:
-            # Hazards/Flooding that do not actually close or restrict access are
-            # outside the road-impact scope of this dashboard.
+        combined = norm(f"{impact.get('impact_type')} {impact.get('impact_subtype')}")
+        if "closure" in combined or "closed" in combined:
+            subtype = "closure"
+        elif "lane" in combined or "restriction" in combined:
+            subtype = "restriction"
+        else:
             continue
-
         duration = props.get("duration") or {}
         if not active_now(duration.get("start"), duration.get("end")):
             continue
-
         summary = props.get("road_summary") or {}
         geometry = feature.get("geometry")
         coords = representative_point(geometry)
         lga = clean(summary.get("local_government_area")) or locate_lga(coords, lgas)
         road = clean(summary.get("road_name")) or "Queensland road"
         status = clean(impact.get("impact_subtype") or impact.get("impact_type")) or title_case(subtype)
-
         incidents.append({
             "id": f"roads-{props.get('id') or stable_id(road, status, duration.get('start'))}",
             "sector": "roads",
             "subtype": subtype,
-            "event_category": event_category,
             "title": f"{road}: {status}",
             "description": clean(props.get("description")),
             "status": status,
@@ -497,13 +370,13 @@ def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str,
             "coordinates": coords,
             "geometry": geometry,
             "customers": 0,
-            "planned": False,
+            "planned": norm(props.get("event_type")) == "roadworks",
             "updated": iso(props.get("last_updated")) or NOW_ISO,
             "source_name": "QLDTraffic",
-            "source_url": OFFICIAL_SOURCE_URLS["qldtraffic"],
+            "source_url": clean(props.get("url") or props.get("web_link")) or SOURCES["qldtraffic"]["url"],
         })
-
     return incidents
+
 
 def property_value(properties: dict[str, Any], *names: str) -> Any:
     index = {re.sub(r"[^a-z0-9]", "", str(key).lower()): value for key, value in properties.items()}
@@ -569,255 +442,8 @@ def parse_power(payload: dict[str, Any], provider: str, source_key: str, lgas: d
             "updated": NOW_ISO,
             "estimated_restore": iso(property_value(props, "EST_FIX_TIME", "ESTIMATED_RESTORATION", "ETR")) or clean(property_value(props, "EST_FIX_TIME", "ESTIMATED_RESTORATION", "ETR")),
             "source_name": provider,
-            "source_url": OFFICIAL_SOURCE_URLS[source_key],
+            "source_url": SOURCES[source_key]["url"],
         })
-    return incidents
-
-
-
-def parse_kml_coordinates(value: str) -> list[list[float]]:
-    """Convert KML lon,lat[,alt] coordinate text to GeoJSON positions."""
-    coordinates: list[list[float]] = []
-    for token in re.split(r"\s+", clean(value)):
-        parts = token.split(",")
-        if len(parts) < 2:
-            continue
-        try:
-            coordinates.append([float(parts[0]), float(parts[1])])
-        except ValueError:
-            continue
-    return coordinates
-
-
-def kml_placemark_geometry(placemark: ET.Element, namespace: dict[str, str]) -> dict[str, Any] | None:
-    """Extract the most useful GeoJSON geometry from an Essential Energy placemark."""
-    geometries: list[dict[str, Any]] = []
-
-    for polygon in placemark.findall(".//kml:Polygon", namespace):
-        rings: list[list[list[float]]] = []
-        outer = polygon.find("./kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", namespace)
-        if outer is not None and outer.text:
-            ring = parse_kml_coordinates(outer.text)
-            if ring:
-                if ring[0] != ring[-1]:
-                    ring.append(ring[0])
-                rings.append(ring)
-        for inner in polygon.findall("./kml:innerBoundaryIs/kml:LinearRing/kml:coordinates", namespace):
-            if inner.text:
-                ring = parse_kml_coordinates(inner.text)
-                if ring:
-                    if ring[0] != ring[-1]:
-                        ring.append(ring[0])
-                    rings.append(ring)
-        if rings:
-            geometries.append({"type": "Polygon", "coordinates": rings})
-
-    for point in placemark.findall(".//kml:Point/kml:coordinates", namespace):
-        if point.text:
-            coordinates = parse_kml_coordinates(point.text)
-            if coordinates:
-                geometries.append({"type": "Point", "coordinates": coordinates[0]})
-
-    for line in placemark.findall(".//kml:LineString/kml:coordinates", namespace):
-        if line.text:
-            coordinates = parse_kml_coordinates(line.text)
-            if coordinates:
-                geometries.append({"type": "LineString", "coordinates": coordinates})
-
-    if not geometries:
-        return None
-    if len(geometries) == 1:
-        return geometries[0]
-    return next((item for item in geometries if item.get("type") == "Polygon"), {
-        "type": "GeometryCollection",
-        "geometries": geometries,
-    })
-
-
-def decode_essential_html(value: Any) -> str:
-    """Decode the repeatedly escaped HTML stored in Essential Energy KML."""
-    text = clean(value)
-    text = text.replace("&amp;amp;lt;", "&amp;lt;").replace("&amp;amp;gt;", "&amp;gt;").replace("&amp;amp;amp;", "&amp;amp;")
-    for _ in range(5):
-        decoded = html.unescape(text)
-        if decoded == text:
-            break
-        text = decoded
-    return text
-
-
-def essential_plain_text(value: str) -> str:
-    text = re.sub(r"<br\s*/?>", "\n", value, flags=re.I)
-    text = re.sub(r"</(?:div|p|h[1-6])\s*>", "\n", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", "", text)
-    return "\n".join(clean(line) for line in html.unescape(text).splitlines() if clean(line))
-
-
-def essential_label_value(decoded_html: str, label: str) -> str:
-    pattern = re.compile(
-        r"<span[^>]*>\s*" + re.escape(label) + r"\s*</span>\s*(.*?)\s*</div>",
-        flags=re.I | re.S,
-    )
-    match = pattern.search(decoded_html)
-    return clean(essential_plain_text(match.group(1))) if match else ""
-
-
-def parse_essential_date(value: Any) -> datetime | None:
-    """Parse Essential Energy's NSW-local human-readable KML timestamps."""
-    text = clean(value)
-    if not text:
-        return None
-    normalized = re.sub(r"\s+", " ", text)
-    normalized = re.sub(r"\ba\.m\.\b", "AM", normalized, flags=re.I)
-    normalized = re.sub(r"\bp\.m\.\b", "PM", normalized, flags=re.I)
-    normalized = re.sub(r"\bam\b", "AM", normalized, flags=re.I)
-    normalized = re.sub(r"\bpm\b", "PM", normalized, flags=re.I)
-    formats = (
-        "%d/%m/%Y %I:%M:%S %p", "%d/%m/%Y %I:%M %p",
-        "%d/%m/%y %I:%M:%S %p", "%d/%m/%y %I:%M %p",
-        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
-        "%d/%m/%y %H:%M:%S", "%d/%m/%y %H:%M",
-        "%d %b %Y %I:%M %p", "%d %b %Y %H:%M",
-        "%I:%M%p %d %b %Y", "%I:%M %p %d %b %Y", "%H:%M %d %b %Y",
-    )
-    for fmt in formats:
-        try:
-            return datetime.strptime(normalized, fmt).replace(tzinfo=ESSENTIAL_TZ).astimezone(AEST)
-        except ValueError:
-            pass
-    return parse_date(normalized)
-
-
-def essential_fields(name: str, description: str) -> dict[str, Any]:
-    decoded = decode_essential_html(description)
-    plain = essential_plain_text(decoded)
-    heading_match = re.search(r"<h2[^>]*>(.*?)</h2>", decoded, flags=re.I | re.S)
-    incident = clean(essential_plain_text(heading_match.group(1))) if heading_match else clean(name)
-
-    labelled = {
-        "time_off": essential_label_value(decoded, "Time Off:"),
-        "estimated_restore": essential_label_value(decoded, "Est. Time On:"),
-        "customers": essential_label_value(decoded, "No. of Customers affected:"),
-        "reason": essential_label_value(decoded, "Reason:"),
-        "last_updated": essential_label_value(decoded, "Last Updated:"),
-    }
-    pairs: dict[str, str] = {}
-    for line in plain.splitlines():
-        match = re.match(r"^([^:]{2,80})\s*:\s*(.+)$", line)
-        if match:
-            pairs[norm(match.group(1))] = clean(match.group(2))
-
-    def first(*keys: str) -> str:
-        for key in keys:
-            value = pairs.get(norm(key))
-            if value:
-                return value
-        return ""
-
-    time_off = labelled["time_off"] or first("time off", "start", "started", "start time", "outage start")
-    estimated_restore = labelled["estimated_restore"] or first(
-        "est time on", "estimated restoration", "estimated restore", "etr", "finish", "end time"
-    )
-    customers_text = labelled["customers"] or first(
-        "no of customers affected", "customers affected", "affected customers", "customers", "customer count"
-    )
-    reason = labelled["reason"] or first("cause", "reason", "outage cause")
-    last_updated = labelled["last_updated"] or first("last updated", "updated")
-    suburb = first("suburb", "suburbs", "locality", "town")
-    streets = first("street", "streets", "location", "affected area")
-    status = first("status") or "Outage reported"
-
-    return {
-        "incident": incident,
-        "reason": reason,
-        "status": status,
-        "suburb": suburb,
-        "streets": streets,
-        "customers": parse_int(customers_text),
-        "time_off": parse_essential_date(time_off),
-        "estimated_restore": parse_essential_date(estimated_restore),
-        "last_updated": parse_essential_date(last_updated),
-    }
-
-
-def infer_essential_outage_type(style_url: Any) -> str | None:
-    """Classify Essential Energy placemarks exactly as the supplied ZIP does."""
-    style = clean(style_url).lower()
-    if "unplanned" in style:
-        return "unplanned"
-    if "planned" in style:
-        return "planned"
-    return None
-
-
-def parse_essential_power(kml_data: bytes, lgas: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return only unplanned Essential Energy outages located in Queensland."""
-    root = ET.fromstring(kml_data)
-    namespace_uri = root.tag.split("}", 1)[0].lstrip("{") if root.tag.startswith("{") else "http://www.opengis.net/kml/2.2"
-    namespace = {"kml": namespace_uri}
-    incidents: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    for placemark in root.findall(".//kml:Placemark", namespace):
-        name_node = placemark.find("kml:name", namespace)
-        description_node = placemark.find("kml:description", namespace)
-        style_node = placemark.find("kml:styleUrl", namespace)
-        name = clean(name_node.text if name_node is not None else "")
-        description = description_node.text if description_node is not None and description_node.text else ""
-        style_url = clean(style_node.text if style_node is not None else "")
-
-        # Essential's KML encodes planned/unplanned state in styleUrl. Keep only
-        # explicit unplanned records; planned and unknown styles are excluded.
-        if infer_essential_outage_type(style_url) != "unplanned":
-            continue
-
-        geometry = kml_placemark_geometry(placemark, namespace)
-        coords, footprint = power_geometry(geometry)
-        lga = locate_lga(coords, lgas)
-
-        # Essential Energy also covers NSW. A successful Queensland LGA match is
-        # required before the outage is allowed into the application.
-        if not lga:
-            continue
-
-        fields = essential_fields(name, description)
-        locality = clean(fields["suburb"] or fields["incident"] or name) or lga
-        event_id = stable_id(
-            "Essential Energy",
-            locality,
-            round(coords[0], 5) if coords else "",
-            round(coords[1], 5) if coords else "",
-            fields["time_off"] or "",
-        )
-        if event_id in seen:
-            continue
-        seen.add(event_id)
-
-        reason = clean(fields["reason"])
-        streets = clean(fields["streets"])
-        description_text = ". ".join(part for part in (
-            reason,
-            f"Affected area: {streets}" if streets else "",
-        ) if part)
-        incidents.append({
-            "id": f"power-essential-{event_id}",
-            "sector": "power",
-            "subtype": "unplanned",
-            "title": f"{title_case(locality)} unplanned power outage",
-            "description": description_text,
-            "status": clean(fields["status"]) or "Outage reported",
-            "lga": lga,
-            "locality": title_case(locality),
-            "coordinates": coords,
-            "geometry": footprint,
-            "customers": int(fields["customers"] or 0),
-            "planned": False,
-            "updated": iso(fields["last_updated"]) or NOW_ISO,
-            "estimated_restore": iso(fields["estimated_restore"]) or None,
-            "source_name": "Essential Energy",
-            "source_url": OFFICIAL_SOURCE_URLS["essential"],
-        })
-
     return incidents
 
 
@@ -900,7 +526,7 @@ def parse_schools(text: str, lgas: dict[str, Any]) -> list[dict[str, Any]]:
             "planned": False,
             "updated": NOW_ISO,
             "source_name": "Queensland Department of Education",
-            "source_url": OFFICIAL_SOURCE_URLS["schools"],
+            "source_url": "https://closures.qld.edu.au/",
             "school_sector": sector,
         })
     return incidents
@@ -911,93 +537,37 @@ def strip_html(value: str) -> str:
 
 
 def parse_rail(xml_data: bytes) -> list[dict[str, Any]]:
-    """Parse Translink's train-status RSS feed.
-
-    The current feed reports each line with a simple description value of
-    ``Major``, ``Minor`` or ``Normal``. Major and Minor are active service
-    disruptions; Normal is excluded. Older descriptive feed wording remains
-    supported as a fallback.
-    """
     root = ET.fromstring(xml_data)
-    channel = root.find("channel")
-    channel_pub_date = ""
-    if channel is not None:
-        pub_date_node = channel.find("pubDate")
-        channel_pub_date = clean(pub_date_node.text if pub_date_node is not None else "")
-    feed_updated = iso(channel_pub_date) or NOW_ISO
-
-    incidents: list[dict[str, Any]] = []
-    active_keywords = (
-        "closed",
-        "closure",
-        "suspended",
-        "not running",
-        "no trains",
-        "replacement bus",
-        "cancelled",
-        "canceled",
-        "delay",
-        "disruption",
-        "track work",
-    )
-    closure_keywords = ("closed", "closure", "suspended", "not running", "no trains")
-
+    incidents = []
+    terms = ("closed", "closure", "suspended", "not running", "no trains", "replacement bus", "cancelled", "canceled", "major delay", "track work")
     for item in root.findall(".//item"):
         def value(tag: str) -> str:
             element = item.find(tag)
             return clean(element.text if element is not None else "")
-
-        line_name = value("title") or "Rail service"
-        raw_description = strip_html(value("description"))
-        status_key = norm(raw_description)
-        combined = norm(f"{line_name} {raw_description}")
-
-        # Current Translink status feed: retain Major and Minor, ignore Normal.
-        if status_key == "normal":
+        title = value("title") or "Rail service update"
+        description = strip_html(value("description"))
+        combined = norm(f"{title} {description}")
+        if not any(term in combined for term in terms):
             continue
-        if status_key in {"major", "minor"}:
-            is_active = True
-            is_closure = False
-            description = f"Translink feed status: {raw_description}."
-        else:
-            # Backwards-compatible handling for descriptive RSS messages.
-            is_active = any(keyword in combined for keyword in active_keywords)
-            if not is_active:
-                continue
-            is_closure = any(keyword in combined for keyword in closure_keywords)
-            description = raw_description or "Translink reports a train service disruption."
-
+        closure = any(term in combined for term in ("closed", "closure", "suspended", "not running", "no trains"))
         link = value("link") or SOURCES["rail"]["url"]
-        item_updated = iso(value("pubDate")) or feed_updated
-        service_key = canonical_rail_service_name(line_name)
-        display_line_name = re.sub(r"\s+line\s*$", "", clean(line_name), flags=re.I) or clean(line_name)
         incidents.append({
-            # The RSS item URL can change whenever Translink republishes the
-            # feed. Identify a rail incident by its service/line instead, so an
-            # unchanged line is not counted as a newly disrupted line.
-            "id": f"rail-{stable_id(service_key)}",
-            "service_key": service_key,
-            "line_name": display_line_name,
+            "id": f"rail-{stable_id(title, link)}",
             "sector": "rail",
-            "subtype": "closure" if is_closure else "disruption",
-            "title": f"{display_line_name} line service disruption",
+            "subtype": "closure" if closure else "disruption",
+            "title": title,
             "description": description,
-            "status": "Service disruption",
-            # Keep the source-reported operational state separately from the
-            # display label. Feed publication timestamps can change without the
-            # service condition changing; trend detection compares this field.
-            "impact_state": status_key if status_key in {"major", "minor"} else "active",
+            "status": "Closure / suspension" if closure else "Significant disruption",
             "lga": None,
             "locality": "Queensland rail network",
             "coordinates": None,
             "geometry": None,
             "customers": 0,
             "planned": "track work" in combined or "planned" in combined,
-            "updated": item_updated,
+            "updated": iso(value("pubDate")) or NOW_ISO,
             "source_name": "Translink",
             "source_url": link,
         })
-
     return incidents
 
 
@@ -1025,284 +595,7 @@ def source_result(name: str, status: str, count: int, error: str | None = None) 
     }
 
 
-def incident_official_lgas(incident: dict[str, Any], official_names: set[str]) -> set[str]:
-    """Return only official Queensland LGAs represented by an incident label."""
-    names: set[str] = set()
-    for raw_name in re.split(r"\s*/\s*|\s*;\s*", clean(incident.get("lga"))):
-        name = LGA_ALIASES.get(raw_name, raw_name)
-        if name in official_names:
-            names.add(name)
-    return names
-
-
-def calculate_kpi_snapshot(incidents: list[dict[str, Any]], lgas: dict[str, Any], at: str) -> dict[str, Any]:
-    """Create the compact statewide values used by the KPI trend visuals."""
-    roads = [item for item in incidents if item.get("sector") == "roads"]
-    power = [item for item in incidents if item.get("sector") == "power"]
-    rail = [item for item in incidents if item.get("sector") == "rail"]
-    schools = [item for item in incidents if item.get("sector") == "schools"]
-    official_names = {
-        clean(feature.get("properties", {}).get("display_name"))
-        for feature in lgas.get("features", [])
-        if clean(feature.get("properties", {}).get("display_name"))
-    }
-    affected_lgas: set[str] = set()
-    for incident in incidents:
-        affected_lgas.update(incident_official_lgas(incident, official_names))
-    return {
-        "at": at,
-        "roads": sum(1 for item in roads if item.get("subtype") == "closure"),
-        "power_customers": sum(int(item.get("customers") or 0) for item in power),
-        "power_outages": len(power),
-        "rail": len(rail),
-        "schools": len(schools),
-        "lgas": len(affected_lgas),
-    }
-
-
-def incident_index(incidents: list[dict[str, Any]], sector: str) -> dict[str, dict[str, Any]]:
-    """Index stable incident identities for change detection."""
-    return {
-        clean(item.get("id")): item
-        for item in incidents
-        if item.get("sector") == sector and clean(item.get("id"))
-    }
-
-
-def canonical_rail_service_name(value: Any) -> str:
-    """Normalise a Translink service name to one durable comparison key.
-
-    Translink titles commonly include the word ``line`` while legacy dashboard
-    titles added another ``line service disruption`` suffix. Remove display
-    wording from every source before comparison so ``Airport``, ``Airport
-    line`` and ``Airport line line service disruption`` are one service.
-    """
-    key = norm(value)
-    previous = None
-    while key and key != previous:
-        previous = key
-        key = re.sub(r"\b(?:train|rail)?\s*line service disruption\b$", "", key).strip()
-        key = re.sub(r"\bservice disruption\b$", "", key).strip()
-        key = re.sub(r"\b(?:train|rail)?\s*line\b$", "", key).strip()
-    return key
-
-
-def rail_service_key(incident: dict[str, Any]) -> str:
-    """Return a stable service identity for current and legacy rail records."""
-    for value in (
-        incident.get("service_key"),
-        incident.get("line_name"),
-        incident.get("title"),
-    ):
-        key = canonical_rail_service_name(value)
-        if key:
-            return key
-
-    return clean(incident.get("id"))
-
-
-def rail_incident_index(incidents: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Index rail incidents by stable service name, never by mutable RSS URL."""
-    indexed: dict[str, dict[str, Any]] = {}
-    for item in incidents:
-        if item.get("sector") != "rail":
-            continue
-        key = rail_service_key(item)
-        if not key:
-            continue
-        existing = indexed.get(key)
-        if existing is None or rail_impact_level(item) > rail_impact_level(existing):
-            indexed[key] = item
-    return indexed
-
-
-def rail_impact_level(incident: dict[str, Any]) -> int:
-    """Return an operational level without treating feed refreshes as changes.
-
-    Major is operationally worse than Minor. Older embedded records may not
-    contain ``impact_state``; infer it from their source text where possible,
-    otherwise return 0 so deployment of this version does not invent a change.
-    """
-    state = norm(incident.get("impact_state"))
-    if state == "major":
-        return 2
-    if state == "minor":
-        return 1
-    combined = norm(f"{incident.get('status')} {incident.get('description')}")
-    if re.search(r"\bmajor\b", combined):
-        return 2
-    if re.search(r"\bminor\b", combined):
-        return 1
-    return 0
-
-
-def affected_official_lgas(incidents: list[dict[str, Any]], lgas: dict[str, Any]) -> set[str]:
-    official_names = {
-        clean(feature.get("properties", {}).get("display_name"))
-        for feature in lgas.get("features", [])
-        if clean(feature.get("properties", {}).get("display_name"))
-    }
-    affected: set[str] = set()
-    for incident in incidents:
-        affected.update(incident_official_lgas(incident, official_names))
-    return affected
-
-
-def calculate_operational_changes(
-    previous_incidents: list[dict[str, Any]],
-    current_incidents: list[dict[str, Any]],
-    lgas: dict[str, Any],
-    since: str,
-    at: str,
-) -> dict[str, Any]:
-    """Calculate only new, worsened, improved, or resolved operational impact.
-
-    Routine source publication timestamps and text refreshes do not contribute.
-    The signed KPI trend is produced by subtracting ``*_down`` from ``*_up``.
-    """
-    previous_roads = incident_index(previous_incidents, "roads")
-    current_roads = incident_index(current_incidents, "roads")
-    previous_closures = {key for key, item in previous_roads.items() if item.get("subtype") == "closure"}
-    current_closures = {key for key, item in current_roads.items() if item.get("subtype") == "closure"}
-
-    previous_power = incident_index(previous_incidents, "power")
-    current_power = incident_index(current_incidents, "power")
-    power_up = 0
-    power_down = 0
-    power_events_up = 0
-    power_events_down = 0
-    for key in previous_power.keys() | current_power.keys():
-        before = max(0, int(previous_power.get(key, {}).get("customers") or 0))
-        after = max(0, int(current_power.get(key, {}).get("customers") or 0))
-        if after > before:
-            power_up += after - before
-            power_events_up += 1
-        elif before > after:
-            power_down += before - after
-            power_events_down += 1
-
-    previous_rail = rail_incident_index(previous_incidents)
-    current_rail = rail_incident_index(current_incidents)
-    rail_up = 0
-    rail_down = 0
-    for key in previous_rail.keys() | current_rail.keys():
-        before_item = previous_rail.get(key)
-        after_item = current_rail.get(key)
-        if before_item is None and after_item is not None:
-            rail_up += 1
-            continue
-        if before_item is not None and after_item is None:
-            rail_down += 1
-            continue
-        if before_item is None or after_item is None:
-            continue
-        before_level = rail_impact_level(before_item)
-        after_level = rail_impact_level(after_item)
-        # Unknown legacy state is treated as unchanged on deployment. Once both
-        # snapshots contain source states, Minor <-> Major changes are detected.
-        if before_level and after_level > before_level:
-            rail_up += 1
-        elif after_level and before_level > after_level:
-            rail_down += 1
-
-    previous_schools = set(incident_index(previous_incidents, "schools"))
-    current_schools = set(incident_index(current_incidents, "schools"))
-    previous_lgas = affected_official_lgas(previous_incidents, lgas)
-    current_lgas = affected_official_lgas(current_incidents, lgas)
-
-    return {
-        "since": since,
-        "at": at,
-        "roads_up": len(current_closures - previous_closures),
-        "roads_down": len(previous_closures - current_closures),
-        "power_customers_up": power_up,
-        "power_customers_down": power_down,
-        "power_events_up": power_events_up,
-        "power_events_down": power_events_down,
-        "rail_up": rail_up,
-        "rail_down": rail_down,
-        "schools_up": len(current_schools - previous_schools),
-        "schools_down": len(previous_schools - current_schools),
-        "lgas_up": len(current_lgas - previous_lgas),
-        "lgas_down": len(previous_lgas - current_lgas),
-    }
-
-
-def update_change_history(
-    previous: dict[str, Any],
-    previous_incidents: list[dict[str, Any]],
-    current_incidents: list[dict[str, Any]],
-    lgas: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Append operational-change observations and retain seven days."""
-    history = [
-        dict(item) for item in previous.get("change_history", [])
-        if isinstance(item, dict) and item.get("at")
-    ]
-
-    # Earlier versions could compare ``Airport line`` with the legacy title
-    # ``Airport line line service disruption`` and count every active service as
-    # newly disrupted. During the one-time v4 migration, remove those historical
-    # rail deltas and establish the current feed as the clean baseline. Other
-    # sector histories remain intact.
-    previous_history_version = int(previous.get("change_history_version") or 0)
-    migrating_rail_history = previous_history_version < CHANGE_HISTORY_VERSION
-    if migrating_rail_history:
-        for item in history:
-            item["rail_up"] = 0
-            item["rail_down"] = 0
-            item["schema_version"] = CHANGE_HISTORY_VERSION
-
-    since = clean(previous.get("generated_at")) or NOW_ISO
-    current = calculate_operational_changes(previous_incidents, current_incidents, lgas, since, NOW_ISO)
-    current["schema_version"] = CHANGE_HISTORY_VERSION
-    if migrating_rail_history:
-        # Baseline reset: do not infer a rail change while transitioning from
-        # incompatible legacy identities. Subsequent v4 runs compare canonical
-        # service names and detect only genuine new/worsened/resolved services.
-        current["rail_up"] = 0
-        current["rail_down"] = 0
-    if history and clean(history[-1].get("at")) == NOW_ISO:
-        history[-1] = current
-    else:
-        history.append(current)
-
-    cutoff = NOW - HISTORY_RETENTION
-    retained: list[dict[str, Any]] = []
-    for item in history:
-        item_at = parse_date(item.get("at"))
-        if item_at and item_at >= cutoff:
-            retained.append(item)
-    return retained[-HISTORY_MAX_POINTS:]
-
-
-def update_kpi_history(previous: dict[str, Any], incidents: list[dict[str, Any]], lgas: dict[str, Any]) -> list[dict[str, Any]]:
-    """Preserve, append and prune KPI history across scheduled refreshes."""
-    history = [item for item in previous.get("history", []) if isinstance(item, dict) and item.get("at")]
-
-    # Seed history from the last embedded snapshot when upgrading an existing
-    # dashboard, providing a comparison after the first run of this version.
-    if not history and previous.get("generated_at"):
-        history.append(calculate_kpi_snapshot(previous.get("incidents", []), lgas, clean(previous.get("generated_at"))))
-
-    current = calculate_kpi_snapshot(incidents, lgas, NOW_ISO)
-    last_at = parse_date(history[-1].get("at")) if history else None
-    if last_at and NOW - last_at < HISTORY_MIN_SPACING:
-        history[-1] = current
-    else:
-        history.append(current)
-
-    cutoff = NOW - HISTORY_RETENTION
-    retained = []
-    for item in history:
-        item_at = parse_date(item.get("at"))
-        if item_at and item_at >= cutoff:
-            retained.append(item)
-    return retained[-HISTORY_MAX_POINTS:]
-
-
 def main() -> int:
-    print(f"Refresh script version: {SCRIPT_VERSION}")
     if not INDEX.exists():
         print("index.html was not found beside refresh.py", file=sys.stderr)
         return 1
@@ -1332,7 +625,6 @@ def main() -> int:
         ("qldtraffic", lambda: parse_roads(get_json(SOURCES["qldtraffic"]["url"]), lgas)),
         ("energex", lambda: parse_power(get_json(SOURCES["energex"]["url"], POWER_ARCGIS_PARAMS), "Energex", "energex", lgas)),
         ("ergon", lambda: parse_power(get_json(SOURCES["ergon"]["url"], POWER_ARCGIS_PARAMS), "Ergon Energy", "ergon", lgas)),
-        ("essential", lambda: parse_essential_power(get_essential_kml(), lgas)),
         ("schools", lambda: parse_schools(get_bytes(SOURCES["schools"]["url"]).decode("utf-8-sig"), lgas)),
         ("rail", lambda: parse_rail(get_bytes(SOURCES["rail"]["url"]))),
     ]
@@ -1344,55 +636,19 @@ def main() -> int:
                 record["source_key"] = key
             incidents.extend(records)
             sources[key] = source_result(key, "current", len(records))
-
-            if key == "qldtraffic":
-                hazard_count = sum(record.get("event_category") == "hazard" for record in records)
-                flooding_count = sum(record.get("event_category") == "flooding" for record in records)
-                closure_count = sum(record.get("subtype") == "closure" for record in records)
-                restriction_count = sum(record.get("subtype") == "restriction" for record in records)
-                print(
-                    "QLDTraffic filtered records: "
-                    f"{len(records)} "
-                    f"(hazards={hazard_count}, flooding={flooding_count}, "
-                    f"closures={closure_count}, restrictions={restriction_count})"
-                )
-            else:
-                print(f"{SOURCES[key]['name']}: {len(records)} records")
-
+            print(f"{SOURCES[key]['name']}: {len(records)} records")
         except Exception as exc:  # noqa: BLE001
             fallback = previous_by_source.get(key, [])
-
-            if key == "qldtraffic":
-                # Critical safety rule: pre-v6 QLDTraffic records are untagged
-                # and may contain categories the user explicitly excluded.
-                fallback = qldtraffic_fallback_records(fallback)
-                print(
-                    "QLDTraffic: ERROR - "
-                    f"{exc}. Retaining {len(fallback)} previously verified "
-                    "Hazard/Flooding closure/restriction records."
-                )
-            else:
-                print(f"{SOURCES[key]['name']}: ERROR - {exc}")
-
             incidents.extend(fallback)
-            sources[key] = source_result(
-                key,
-                "fallback" if fallback else "error",
-                len(fallback),
-                str(exc),
-            )
+            sources[key] = source_result(key, "fallback" if fallback else "error", len(fallback), str(exc))
+            print(f"{SOURCES[key]['name']}: ERROR - {exc}")
 
-    history = update_kpi_history(previous, incidents, lgas)
-    change_history = update_change_history(previous, previous_incidents, incidents, lgas)
     data = {
         "generated_at": NOW_ISO,
         "notice": "Snapshot refreshed automatically by GitHub. Scheduled runs occur every 15 minutes; individual source publication times may differ.",
         "incidents": incidents,
         "lgas": lgas,
         "sources": sources,
-        "history": history,
-        "change_history": change_history,
-        "change_history_version": CHANGE_HISTORY_VERSION,
     }
     write_embedded(data)
     print(f"Updated {INDEX.name}: {len(incidents)} total incidents")
