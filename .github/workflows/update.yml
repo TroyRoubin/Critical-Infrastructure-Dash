@@ -50,7 +50,7 @@ jobs:
             python -m pip install -r requirements.txt
           fi
 
-      - name: Repair refresh.py and apply Hazard/Flooding filter
+      - name: Apply QLDTraffic Queensland-only filter
         shell: bash
         run: |
           set -euo pipefail
@@ -65,15 +65,13 @@ jobs:
             fi
 
             if grep -q 'Apply the Critical Infrastructure Dashboard QLDTraffic KPI fix' refresh.py; then
-              echo "refresh.py contains the patch-helper instead of the dashboard refresher."
-              echo "Restoring known-good refresh.py before applying the filter."
+              echo "refresh.py contains the old patch-helper; restoring dashboard refresher."
               git show "${GOOD_REFRESH_COMMIT}:refresh.py" > refresh.py
               return
             fi
 
             if ! grep -q 'Refresh the data embedded in index.html' refresh.py; then
-              echo "refresh.py does not look like the dashboard refresher."
-              echo "Restoring known-good refresh.py."
+              echo "refresh.py does not look like the dashboard refresher; restoring it."
               git show "${GOOD_REFRESH_COMMIT}:refresh.py" > refresh.py
             fi
           }
@@ -88,10 +86,21 @@ jobs:
           text = path.read_text(encoding="utf-8")
 
           marker = "# QLDTraffic filter: Hazard + Flooding only"
+          qld_marker = "# Queensland-only road geography filter"
 
           new_roads = r'''
           # QLDTraffic filter: Hazard + Flooding only
+          # Queensland-only road geography filter
           QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
+
+          # Fast coarse bounds used before the exact Queensland LGA check.
+          # Coordinates are GeoJSON order: [longitude, latitude].
+          QLDTRAFFIC_QLD_BOUNDS = {
+              "min_lon": 137.8,
+              "max_lon": 153.7,
+              "min_lat": -29.25,
+              "max_lat": -9.0,
+          }
 
 
           def qldtraffic_event_category(properties: dict[str, Any]) -> str | None:
@@ -99,12 +108,89 @@ jobs:
               return category if category in QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES else None
 
 
-          def qldtraffic_fallback_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+          def qldtraffic_in_qld_bounds(point: list[float] | None) -> bool:
+              if not point or len(point) < 2:
+                  return False
+              lon, lat = float(point[0]), float(point[1])
+              return (
+                  QLDTRAFFIC_QLD_BOUNDS["min_lon"] <= lon <= QLDTRAFFIC_QLD_BOUNDS["max_lon"]
+                  and QLDTRAFFIC_QLD_BOUNDS["min_lat"] <= lat <= QLDTRAFFIC_QLD_BOUNDS["max_lat"]
+              )
+
+
+          def qldtraffic_coordinate_in_queensland(
+              point: list[float] | None,
+              lgas: dict[str, Any],
+          ) -> tuple[bool, str | None]:
+              if not qldtraffic_in_qld_bounds(point):
+                  return False, None
+
+              # When the embedded Queensland LGA polygons are available, use
+              # them as the authoritative state-boundary test.
+              if lgas.get("features"):
+                  lga = locate_lga(point, lgas)
+                  return (lga is not None), lga
+
+              # If LGA geometry is temporarily unavailable, retain the coarse
+              # Queensland bounding-box safeguard rather than displaying
+              # obviously interstate records.
+              return True, None
+
+
+          def qldtraffic_location_in_queensland(
+              geometry: dict[str, Any] | None,
+              lgas: dict[str, Any],
+          ) -> tuple[list[float] | None, str | None]:
+              # Try the representative point first. For line/polygon events near
+              # a border, also sample several actual geometry vertices so a
+              # centroid outside Queensland does not discard a valid QLD event.
+              candidates: list[list[float]] = []
+
+              representative = representative_point(geometry)
+              if representative:
+                  candidates.append(representative)
+
+              points = all_points(geometry)
+              if points:
+                  indexes = (
+                      0,
+                      len(points) // 4,
+                      len(points) // 2,
+                      (3 * len(points)) // 4,
+                      len(points) - 1,
+                  )
+                  for index in indexes:
+                      point = points[index]
+                      if point not in candidates:
+                          candidates.append(point)
+
+              for point in candidates:
+                  inside, lga = qldtraffic_coordinate_in_queensland(point, lgas)
+                  if inside:
+                      return point, lga
+
+              return None, None
+
+
+          def qldtraffic_fallback_records(
+              records: list[dict[str, Any]],
+              lgas: dict[str, Any],
+          ) -> list[dict[str, Any]]:
+              # Cached road records must satisfy BOTH the event-category filter
+              # and the Queensland geography filter.
               filtered = []
               for item in records:
                   category = norm(item.get("event_category") or item.get("event_type"))
-                  if category in QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES:
+                  if category not in QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES:
+                      continue
+
+                  inside, _ = qldtraffic_coordinate_in_queensland(
+                      item.get("coordinates"),
+                      lgas,
+                  )
+                  if inside:
                       filtered.append(item)
+
               return filtered
 
 
@@ -114,6 +200,7 @@ jobs:
               for feature in payload.get("features", []):
                   props = feature.get("properties") or {}
 
+                  # KPI inclusion filter: QLDTraffic Hazards + Flooding only.
                   event_category = qldtraffic_event_category(props)
                   if event_category is None:
                       continue
@@ -123,6 +210,14 @@ jobs:
 
                   duration = props.get("duration") or {}
                   if not active_now(duration.get("start"), duration.get("end")):
+                      continue
+
+                  summary = props.get("road_summary") or {}
+                  geometry = feature.get("geometry")
+
+                  # Map/state inclusion filter: Queensland only.
+                  coords, qld_lga = qldtraffic_location_in_queensland(geometry, lgas)
+                  if coords is None:
                       continue
 
                   impact = props.get("impact") or {}
@@ -137,10 +232,8 @@ jobs:
                   else:
                       subtype = "incident"
 
-                  summary = props.get("road_summary") or {}
-                  geometry = feature.get("geometry")
-                  coords = representative_point(geometry)
-                  lga = clean(summary.get("local_government_area")) or locate_lga(coords, lgas)
+                  # Prefer the LGA proved by the Queensland polygon check.
+                  lga = qld_lga or clean(summary.get("local_government_area"))
                   road = clean(summary.get("road_name")) or "Queensland road"
 
                   event_type = clean(props.get("event_type")) or title_case(event_category)
@@ -176,7 +269,19 @@ jobs:
 
           '''
 
-          if marker not in text:
+          # If the earlier Hazard/Flooding block is already present, replace the
+          # entire block with this Queensland-only version. This makes v3 update
+          # an existing v2 installation rather than silently doing nothing.
+          if marker in text:
+              block_pattern = re.compile(
+                  r"(?ms)^# QLDTraffic filter: Hazard \+ Flooding only\n.*?"
+                  r"(?=^def property_value\()"
+              )
+              match = block_pattern.search(text)
+              if not match:
+                  raise SystemExit("Could not locate the existing QLDTraffic filter block.")
+              text = text[:match.start()] + new_roads + text[match.end():]
+          else:
               parse_pattern = re.compile(
                   r"(?ms)^def parse_roads\([^\n]*\)"
                   r"(?:\s*->\s*[^:\n]+)?"
@@ -186,10 +291,16 @@ jobs:
               match = parse_pattern.search(text)
               if not match:
                   raise SystemExit("Could not locate parse_roads() in refresh.py.")
-
               text = text[:match.start()] + new_roads + text[match.end():]
 
-          if "qldtraffic_fallback_records(previous_by_source.get(key, []))" not in text:
+          # Upgrade the cached QLDTraffic fallback to apply the same QLD boundary
+          # check. This also cleans out any previously embedded interstate roads.
+          text = text.replace(
+              "qldtraffic_fallback_records(previous_by_source.get(key, []))",
+              "qldtraffic_fallback_records(previous_by_source.get(key, []), lgas)",
+          )
+
+          if "qldtraffic_fallback_records(previous_by_source.get(key, []), lgas)" not in text:
               fallback_pattern = re.compile(
                   r"(?m)^(?P<indent>[ \t]+)fallback = previous_by_source\.get\(key, \[\]\)[ \t]*$"
               )
@@ -200,7 +311,7 @@ jobs:
               indent = match.group("indent")
               replacement = (
                   f"{indent}fallback = (\n"
-                  f"{indent}    qldtraffic_fallback_records(previous_by_source.get(key, []))\n"
+                  f"{indent}    qldtraffic_fallback_records(previous_by_source.get(key, []), lgas)\n"
                   f'{indent}    if key == "qldtraffic"\n'
                   f"{indent}    else previous_by_source.get(key, [])\n"
                   f"{indent})"
@@ -209,9 +320,11 @@ jobs:
 
           required = [
               marker,
+              qld_marker,
               '"event_category": event_category',
               'QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}',
-              "qldtraffic_fallback_records(previous_by_source.get(key, []))",
+              "qldtraffic_location_in_queensland(geometry, lgas)",
+              "qldtraffic_fallback_records(previous_by_source.get(key, []), lgas)",
           ]
           for token in required:
               if token not in text:
@@ -219,7 +332,7 @@ jobs:
 
           compile(text, str(path), "exec")
           path.write_text(text, encoding="utf-8")
-          print("QLDTraffic road KPI filter applied: Hazard + Flooding only.")
+          print("QLDTraffic filter applied: Hazard + Flooding, Queensland only.")
           PY
 
           repair_refresh
