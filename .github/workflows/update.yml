@@ -352,40 +352,45 @@ jobs:
           python -m py_compile refresh.py
 
 
-      - name: Capture verified MSQ current warnings v7
+      - name: Capture verified MSQ current warnings v8
         id: msq_capture
         shell: bash
         run: |
           set -euo pipefail
           cat > /tmp/capture_msq_current.py <<'PY'
           #!/usr/bin/env python3
-          """Capture current MSQ warnings from the rendered Guardian dashboard.
-
-          v7 fixes the v6 selector blind spot by combining three verified browser paths:
-          1) area-aware rendered DOM/shadow-DOM ancestor blocks,
-          2) structured XHR/fetch JSON records, and
-          3) rendered body-text windows around named maritime areas.
-
-          No JavaScript bundle/source string scanning is used. Network records are accepted only
-          when they are area-specific, operational-warning-like, not explicitly inactive, and
-          are either visibly corroborated by the rendered page or explicitly marked current/active.
+          """Capture current Maritime Safety Queensland warnings from the live Guardian dashboard.
+          
+          v8 follows the interaction actually shown by MSQ:
+          1. render the dashboard in Chromium,
+          2. read the authoritative "N Latest Warnings" count,
+          3. open the Latest Warnings tile/modal,
+          4. extract area-specific warning records from the rendered modal, and
+          5. independently capture /dashboard/imsBulletin as supporting structured evidence.
+          
+          A non-zero tile count must reconcile with the extracted record count. If it does not,
+          the Marine source fails closed rather than publishing guessed or stale warnings.
           """
           from __future__ import annotations
-
+          
           from datetime import datetime, timezone
+          import html
           import json
           import os
           from pathlib import Path
           import re
           import traceback
           from typing import Any
-
+          
           from playwright.sync_api import sync_playwright
-
+          
           URL = "https://qldmaritime.msq.qld.gov.au/"
           OUT = Path("/tmp/msq-current-warnings.json")
           DIAGNOSTIC = Path("/tmp/msq-current-diagnostic.json")
-
+          BULLETIN = Path("/tmp/msq-imsBulletin.json")
+          SCREENSHOT = Path("/tmp/msq-current-dashboard.png")
+          MODAL_SCREENSHOT = Path("/tmp/msq-current-modal.png")
+          
           AREA_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
               ("Rockhampton / Fitzroy River", ("rockhampton", "fitzroy river", "port alma")),
               ("Gladstone", ("gladstone", "port curtis")),
@@ -420,7 +425,7 @@ jobs:
               ("Karumba", ("karumba",)),
               ("Gulf of Carpentaria", ("gulf of carpentaria",)),
           )
-
+          
           ZERO_PHRASES = (
               "no current maritime warnings",
               "no active maritime warnings",
@@ -429,29 +434,30 @@ jobs:
               "no current marine warnings",
               "no active marine warnings",
           )
-
-          INACTIVE_STATES = {"inactive", "expired", "archived", "cancelled", "canceled", "deleted", "closed record"}
-          ACTIVE_STATES = {"active", "current", "published", "live", "open"}
-
-
+          
+          
           def clean(value: Any) -> str:
               return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
+          
+          
           def key(value: Any) -> str:
               return clean(value).casefold()
-
-
+          
+          
           def areas_in_text(value: str) -> list[str]:
               lowered = key(value)
-              return [canonical for canonical, aliases in AREA_ALIASES if any(alias in lowered for alias in aliases)]
-
-
+              return [
+                  canonical
+                  for canonical, aliases in AREA_ALIASES
+                  if any(alias in lowered for alias in aliases)
+              ]
+          
+          
           def warning_parts(value: str) -> tuple[str, str, str]:
               text = clean(value)
               alert_match = re.search(r"\b(red|orange|yellow|white)\s+alert\b", text, re.I)
               alert = alert_match.group(0) if alert_match else ""
-              level_match = re.search(r"\b(emergency warning|watch and act|advice)\b", text, re.I)
+              level_match = re.search(r"\b(emergency warning|watch\s*(?:&|and)\s*act|advice)\b", text, re.I)
               level = level_match.group(0) if level_match else ""
               action_patterns = (
                   r"\bport\s+(?:is\s+)?closed\b",
@@ -471,63 +477,126 @@ jobs:
                       action = match.group(0)
                       break
               return clean(alert), clean(level), clean(action)
-
-
+          
+          
           def signal_score(value: str) -> int:
               lowered = key(value)
               score = 0
-              if re.search(r"\b(red|orange|yellow|white)\s+alert\b", lowered): score += 5
-              if re.search(r"\b(emergency warning|watch and act|advice)\b", lowered): score += 5
-              if re.search(r"\b(port (?:is )?(?:closed|open)|pilotage area (?:is )?closed|waterway (?:is )?closed|closed to (?:all )?vessel traffic|prepare (?:your )?vessel|stay off the water)\b", lowered): score += 5
-              if "locations affected" in lowered or "location affected" in lowered or "affected area" in lowered: score += 2
-              if re.search(r"\b(issued|updated)\s*:?\s*", lowered): score += 2
-              if "maritime warning" in lowered or "marine warning" in lowered: score += 2
-              if "warning" in lowered or "alert" in lowered: score += 1
+              if re.search(r"\b(red|orange|yellow|white)\s+alert\b", lowered):
+                  score += 5
+              if re.search(r"\b(emergency warning|watch\s*(?:&|and)\s*act|advice)\b", lowered):
+                  score += 5
+              if re.search(
+                  r"\b(port (?:is )?(?:closed|open)|pilotage area (?:is )?closed|"
+                  r"waterway (?:is )?closed|closed to (?:all )?vessel traffic|"
+                  r"prepare (?:your )?vessel|stay off the water)\b",
+                  lowered,
+              ):
+                  score += 5
+              if "warning" in lowered or "alert" in lowered:
+                  score += 1
+              if "locations affected" in lowered or "location affected" in lowered or "affected area" in lowered:
+                  score += 2
+              if re.search(r"\b(issued|updated|published)\b", lowered):
+                  score += 1
               return score
-
-
-          def composed_area_blocks(frame) -> list[dict[str, Any]]:
-              """Find named areas with Playwright text locators (pierces open shadow DOM), then inspect composed ancestors."""
+          
+          
+          def title_from_text(value: str, area: str) -> str:
+              lines = [clean(line) for line in str(value or "").splitlines() if clean(line)]
+              for line in lines:
+                  lk = key(line)
+                  if len(line) > 240:
+                      continue
+                  if (
+                      re.search(r"\b(red|orange|yellow|white)\s+alert\b", lk)
+                      or "emergency warning" in lk
+                      or "watch and act" in lk
+                      or re.search(r"\bport\s+(?:is\s+)?(?:closed|open)\b", lk)
+                      or "waterway closed" in lk
+                  ):
+                      return line[:220]
+              alert, level, action = warning_parts(value)
+              parts = [part for part in (alert, level, action) if part]
+              return (" - ".join(parts) if parts else f"Maritime warning - {area}")[:220]
+          
+          
+          def record_from_text(value: str, area_hint: str, source_method: str) -> dict[str, Any] | None:
+              raw = str(value or "").strip()
+              text = clean(raw)
+              if not text or signal_score(text) < 5:
+                  return None
+              areas = areas_in_text(text)
+              area = area_hint if area_hint in areas or not areas else areas[0]
+              if not area:
+                  return None
+              alert, level, action = warning_parts(text)
+              title = title_from_text(raw, area)
+              issued_match = re.search(
+                  r"\b(?:issued|updated|published)\s*(?:on|at|:)?\s*"
+                  r"([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4}[^|\n]{0,80}|"
+                  r"[0-9]{1,2}:[0-9]{2}[^|\n]{0,80})",
+                  text,
+                  re.I,
+              )
+              issued = clean(issued_match.group(1)) if issued_match else ""
+              description = text
+              if key(description).startswith(key(title)):
+                  description = clean(description[len(title):].lstrip(" -:|–—"))
+              return {
+                  "title": title,
+                  "description": description[:3500],
+                  "areas": [area],
+                  "area": area,
+                  "alert_phase": alert,
+                  "warning_level": level,
+                  "action": action,
+                  "issued_text": issued,
+                  "status": "Active maritime warning",
+                  "source_url": URL,
+                  "source_method": source_method,
+              }
+          
+          
+          def modal_area_blocks(frame) -> list[dict[str, Any]]:
+              """After Latest Warnings is opened, find the smallest visible ancestor containing each area + warning signal."""
               result: list[dict[str, Any]] = []
               seen: set[str] = set()
-              js = r"""el => {
+              ancestor_js = r"""el => {
                 const visible = n => {
                   if (!n || !n.getBoundingClientRect) return false;
-                  const r = n.getBoundingClientRect();
-                  const s = getComputedStyle(n);
-                  return s.display !== 'none' && s.visibility !== 'hidden' && r.width >= 2 && r.height >= 2;
+                  const r=n.getBoundingClientRect(), s=getComputedStyle(n);
+                  return s.display!=='none' && s.visibility!=='hidden' && r.width>=2 && r.height>=2;
                 };
                 const parent = n => {
                   if (n.parentElement) return n.parentElement;
-                  const root = n.getRootNode && n.getRootNode();
+                  const root=n.getRootNode && n.getRootNode();
                   return root && root.host ? root.host : null;
                 };
-                const values = [];
-                let n = el;
-                for (let i=0; n && i<12; i++, n=parent(n)) {
+                const out=[];
+                let n=el;
+                for (let i=0; n && i<14; i++, n=parent(n)) {
                   if (!visible(n)) continue;
-                  const t = String(n.innerText || n.textContent || '').replace(/\s+/g,' ').trim();
-                  if (t.length >= 8 && t.length <= 6000) values.push(t);
+                  const t=String(n.innerText || n.textContent || '').trim();
+                  if (t.length>=8 && t.length<=8000) out.push(t);
                 }
-                return values;
+                return out;
               }"""
               for canonical, aliases in AREA_ALIASES:
                   for alias in aliases:
                       try:
                           locator = frame.get_by_text(re.compile(re.escape(alias), re.I), exact=False)
-                          count = min(locator.count(), 12)
+                          count = min(locator.count(), 20)
                       except Exception:
                           continue
                       for index in range(count):
                           try:
-                              texts = locator.nth(index).evaluate(js)
+                              values = locator.nth(index).evaluate(ancestor_js)
                           except Exception:
                               continue
-                          if not isinstance(texts, list):
-                              continue
-                          candidates = []
-                          for value in texts:
-                              text = clean(value)
+                          candidates: list[tuple[int, int, str]] = []
+                          for value in values if isinstance(values, list) else []:
+                              text = str(value or "").strip()
                               if canonical not in areas_in_text(text):
                                   continue
                               score = signal_score(text)
@@ -537,242 +606,151 @@ jobs:
                               continue
                           candidates.sort()
                           text = candidates[0][2]
-                          fingerprint = key(text)
+                          fingerprint = key(f"{canonical}|{text}")
                           if fingerprint in seen:
                               continue
                           seen.add(fingerprint)
-                          result.append({"text": text, "area_hint": canonical, "source_method": "rendered-visible-card"})
-                          if len(result) >= 250:
-                              return result
+                          result.append(
+                              {
+                                  "text": text,
+                                  "area_hint": canonical,
+                                  "source_method": "rendered-visible-card",
+                              }
+                          )
               return result
-
-
-          def body_area_windows(raw_text: str) -> list[dict[str, Any]]:
-              """Fallback for layouts where area and warning labels are visible siblings rather than one card element."""
-              if not raw_text:
-                  return []
-              lines = [clean(line) for line in raw_text.splitlines() if clean(line)]
-              positions = [(index, areas_in_text(line)) for index, line in enumerate(lines) if areas_in_text(line)]
+          
+          
+          def area_windows_from_lines(raw_text: str) -> list[dict[str, Any]]:
+              """Fallback when the warning modal uses sibling rows rather than one card container."""
+              lines = [clean(line) for line in str(raw_text or "").splitlines() if clean(line)]
+              header_re = re.compile(
+                  r"\b((red|orange|yellow|white)\s+alert|emergency warning|watch\s*(?:&|and)\s*act|advice)\b",
+                  re.I,
+              )
+              area_positions: list[tuple[int, str]] = []
+              for index, line in enumerate(lines):
+                  for area in areas_in_text(line):
+                      area_positions.append((index, area))
+          
               result: list[dict[str, Any]] = []
-              seen: set[str] = set()
-              for pos, (index, areas) in enumerate(positions):
-                  previous_area_index = positions[pos - 1][0] if pos > 0 else -1
-                  next_area_index = positions[pos + 1][0] if pos + 1 < len(positions) else len(lines)
-                  # Prefer text from the area line forward to the next named maritime area.
-                  # Only look backward when the forward segment lacks an operational-warning signal.
-                  forward_end = min(next_area_index, index + 20, len(lines))
-                  window = clean(" | ".join(lines[index:forward_end]))
-                  if signal_score(window) < 5:
-                      start = max(previous_area_index + 1, index - 6, 0)
-                      window = clean(" | ".join(lines[start:forward_end]))
-                  if signal_score(window) < 5:
-                      continue
-                  fingerprint = key(f"{areas[0]}|{window}")
-                  if fingerprint in seen:
-                      continue
-                  seen.add(fingerprint)
-                  result.append({"text": window[:6000], "area_hint": areas[0], "source_method": "rendered-visible-text-window"})
-              return result
-
-
-          def walk_dicts(value: Any):
-              if isinstance(value, dict):
-                  yield value
-                  for item in value.values():
-                      yield from walk_dicts(item)
-              elif isinstance(value, list):
-                  for item in value:
-                      yield from walk_dicts(item)
-
-
-          def normalized_key(value: Any) -> str:
-              return re.sub(r"[^a-z0-9]", "", str(value).lower())
-
-
-          def direct_scalar(obj: dict[str, Any], names: tuple[str, ...]) -> str:
-              wanted = {normalized_key(name) for name in names}
-              for k, v in obj.items():
-                  if normalized_key(k) in wanted and isinstance(v, (str, int, float)) and clean(v):
-                      return clean(v)
-              return ""
-
-
-          def object_activity(obj: dict[str, Any]) -> tuple[bool, bool]:
-              """Return (explicitly_active, explicitly_inactive)."""
-              active = False
-              inactive = False
-              for k, v in obj.items():
-                  nk = normalized_key(k)
-                  if nk in {"isactive", "active", "current", "iscurrent", "published", "ispublished"}:
-                      if isinstance(v, bool):
-                          if v: active = True
-                          else: inactive = True
-                      elif key(v) in {"true", "yes", "1", "active", "current", "published", "live"}:
-                          active = True
-                      elif key(v) in {"false", "no", "0", "inactive", "expired", "archived"}:
-                          inactive = True
-                  if nk in {"status", "state", "recordstatus", "publicationstatus"}:
-                      state = key(v)
-                      if state in INACTIVE_STATES: inactive = True
-                      if state in ACTIVE_STATES: active = True
-              return active, inactive
-
-
-          def network_detail_candidates(payloads: list[dict[str, Any]], visible_areas: set[str]) -> list[dict[str, Any]]:
-              """Extract structured current warning records from browser XHR/fetch JSON."""
-              results: list[dict[str, Any]] = []
-              seen: set[str] = set()
-              semantic_key = re.compile(r"warning|alert|title|headline|message|description|detail|status|location|area|issued|updated|port|region|advice", re.I)
-              for response in payloads:
-                  for obj in walk_dicts(response.get("data")):
-                      semantic_keys = [str(k) for k in obj if semantic_key.search(str(k))]
-                      if len(semantic_keys) < 2:
-                          continue
-                      explicitly_active, explicitly_inactive = object_activity(obj)
-                      if explicitly_inactive:
-                          continue
-                      strings = [clean(v) for v in obj.values() if isinstance(v, (str, int, float)) and clean(v)]
-                      joined = " | ".join(strings)
-                      areas = list(dict.fromkeys(areas_in_text(joined)))
-                      if not areas or len(areas) > 3 or signal_score(joined) < 5:
-                          continue
-                      # A structured response must either be explicitly current/active or corroborated by an area visible in the rendered dashboard.
-                      if not explicitly_active and not any(area in visible_areas for area in areas):
-                          continue
-                      title = direct_scalar(obj, ("title", "headline", "subject", "warningTitle", "messageTitle", "name"))
-                      description = direct_scalar(obj, ("description", "details", "detail", "message", "body", "content", "advice", "text"))
-                      area_text = direct_scalar(obj, ("area", "location", "locations", "affectedArea", "affectedAreas", "port", "region"))
-                      status = direct_scalar(obj, ("status", "state", "recordStatus", "publicationStatus"))
-                      issued = direct_scalar(obj, ("issued", "issuedAt", "updated", "updatedAt", "modified", "modifiedAt", "lastUpdated"))
-                      alert, level, action = warning_parts(" | ".join(filter(None, (title, description, joined))))
-                      if not title:
-                          parts = [part for part in (alert, level, action) if part]
-                          title = " - ".join(parts) if parts else "Maritime warning"
-                          if len(parts) < 2:
-                              title = f"{title} - {' / '.join(areas)}"
-                      if not description:
-                          description = joined
-                      signature = key("|".join([",".join(areas), title, alert, level, action]))
-                      if signature in seen:
-                          continue
-                      seen.add(signature)
-                      results.append({
-                          "title": title[:220],
-                          "description": description[:3500],
-                          "areas": areas,
-                          "area": area_text or " / ".join(areas),
-                          "alert_phase": alert,
-                          "warning_level": level,
-                          "action": action,
-                          "issued_text": issued,
-                          "status": status or "Active maritime warning",
-                          "source_url": URL,
-                          "source_method": "structured-browser-network",
-                          "network_url": clean(response.get("url"))[:1000],
-                          "explicit_active": explicitly_active,
-                          "score": signal_score(joined) + (4 if explicitly_active else 0),
-                      })
-                      if len(results) >= 300:
-                          return results
-              return results
-
-
-          def record_from_visible_text(block: dict[str, Any]) -> dict[str, Any] | None:
-              text = clean(block.get("text"))
-              areas = list(dict.fromkeys(areas_in_text(text)))
-              if not areas:
-                  hint = clean(block.get("area_hint"))
-                  if hint: areas = [hint]
-              if not areas or len(areas) > 3:
-                  return None
-              score = signal_score(text)
-              if score < 5:
-                  return None
-              alert, level, action = warning_parts(text)
-              title_line = ""
-              for line in [clean(x) for x in re.split(r"(?:\n|\r|\s{3,}|\s*\|\s*)", text) if clean(x)]:
-                  lk = key(line)
-                  if (
-                      len(line) <= 220
-                      and ("alert" in lk or "warning" in lk or "port closed" in lk or "port open" in lk)
-                      and "locations affected" not in lk
-                      and "location affected" not in lk
-                      and "issued" not in lk
-                      and "updated" not in lk
-                      and lk not in {"maritime warnings", "marine warnings", "warnings", "current warnings", "current maritime warnings", "current marine warnings"}
-                  ):
-                      title_line = line
-                      break
-              if not title_line:
-                  title_parts = [part for part in (alert, level, action) if part]
-                  title_line = " - ".join(title_parts) if title_parts else "Maritime warning"
-                  if len(title_parts) < 2:
-                      title_line = f"{title_line} - {', '.join(areas)}"
-              description = text
-              if key(description).startswith(key(title_line)):
-                  description = clean(description[len(title_line):].lstrip(" -:|–—"))
-              issued_match = re.search(r"\b(?:issued|updated)\s*:?\s*([^|]{4,120})", text, re.I)
-              issued_text = clean(issued_match.group(1)) if issued_match else ""
-              return {
-                  "title": title_line[:220],
-                  "description": description[:3500],
-                  "areas": areas,
-                  "area": " / ".join(areas),
-                  "alert_phase": alert,
-                  "warning_level": level,
-                  "action": action,
-                  "issued_text": issued_text,
-                  "status": "Active maritime warning",
-                  "source_url": URL,
-                  "source_method": clean(block.get("source_method")) or "rendered-visible-card",
-                  "score": score,
-              }
-
-
-          def select_warnings(dom_blocks: list[dict[str, Any]], body_blocks: list[dict[str, Any]], network_details: list[dict[str, Any]]) -> list[dict[str, Any]]:
-              candidates: list[dict[str, Any]] = []
-              for block in dom_blocks + body_blocks:
-                  record = record_from_visible_text(block)
-                  if record:
-                      candidates.append(record)
-              candidates.extend(network_details)
-
-              # Prefer direct rendered cards, then structured network records, then text-window fallbacks.
-              priority = {"rendered-visible-card": 3, "structured-browser-network": 2, "rendered-visible-text-window": 1}
-              groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
-              for item in candidates:
-                  areas = tuple(item.get("areas") or [])
-                  fingerprint = (areas, key(item.get("alert_phase")), key(item.get("warning_level")), key(item.get("action")))
-                  # If the alert taxonomy is absent, retain title to avoid collapsing genuinely different warnings in one area.
-                  if not any(fingerprint[1:]):
-                      fingerprint = fingerprint + (key(item.get("title")),)
-                  groups.setdefault(fingerprint, []).append(item)
-
-              selected: list[dict[str, Any]] = []
-              for items in groups.values():
-                  items.sort(key=lambda item: (
-                      -priority.get(clean(item.get("source_method")), 0),
-                      -int(item.get("score") or 0),
-                      0 if item.get("explicit_active") else 1,
-                      len(clean(item.get("description"))) if clean(item.get("description")) else 99999,
-                  ))
-                  best = dict(items[0])
-                  best.pop("score", None)
-                  best.pop("explicit_active", None)
-                  selected.append(best)
-
-              # Final dedup by area + title after choosing the best evidence source.
-              final: list[dict[str, Any]] = []
-              seen: set[str] = set()
-              for item in sorted(selected, key=lambda x: (x.get("area", ""), x.get("title", ""))):
-                  signature = key("|".join([clean(item.get("area")), clean(item.get("title"))]))
+              seen: set[tuple[str, int]] = set()
+              for index, area in area_positions:
+                  previous_headers = [
+                      j for j in range(max(0, index - 14), index + 1)
+                      if header_re.search(lines[j])
+                  ]
+                  header_index = previous_headers[-1] if previous_headers else max(0, index - 6)
+                  signature = (area, header_index)
                   if signature in seen:
                       continue
                   seen.add(signature)
-                  final.append(item)
-              return final
-
-
+          
+                  next_headers = [
+                      j for j in range(index + 1, min(len(lines), index + 24))
+                      if header_re.search(lines[j])
+                  ]
+                  end = next_headers[0] if next_headers else min(len(lines), index + 16)
+                  joined = "\n".join(lines[header_index:end])
+                  if signal_score(joined) < 5:
+                      continue
+                  result.append(
+                      {
+                          "text": joined,
+                          "area_hint": area,
+                          "source_method": "rendered-visible-text-window",
+                      }
+                  )
+              return result
+          
+          
+          def flatten_scalars(value: Any) -> list[str]:
+              out: list[str] = []
+              if isinstance(value, dict):
+                  for item in value.values():
+                      out.extend(flatten_scalars(item))
+              elif isinstance(value, list):
+                  for item in value:
+                      out.extend(flatten_scalars(item))
+              elif isinstance(value, (str, int, float)) and clean(value):
+                  out.append(clean(value))
+              return out
+          
+          
+          def bulletin_records(payload: Any) -> list[dict[str, Any]]:
+              """Parse imsBulletin broadly, including JSON fields that contain HTML fragments."""
+              if payload is None:
+                  return []
+              scalar_text = "\n".join(flatten_scalars(payload))
+              scalar_text = html.unescape(re.sub(r"<[^>]+>", "\n", scalar_text))
+              blocks = area_windows_from_lines(scalar_text)
+          
+              # Also inspect each dict independently so one bulletin object does not bleed into the next.
+              def walk(value: Any):
+                  if isinstance(value, dict):
+                      yield value
+                      for item in value.values():
+                          yield from walk(item)
+                  elif isinstance(value, list):
+                      for item in value:
+                          yield from walk(item)
+          
+              for obj in walk(payload):
+                  text = html.unescape(re.sub(r"<[^>]+>", "\n", "\n".join(flatten_scalars(obj))))
+                  areas = areas_in_text(text)
+                  if not areas or signal_score(text) < 5:
+                      continue
+                  for area in areas:
+                      blocks.append(
+                          {
+                              "text": text,
+                              "area_hint": area,
+                              "source_method": "structured-browser-network",
+                          }
+                      )
+          
+              records: list[dict[str, Any]] = []
+              seen: set[str] = set()
+              for block in blocks:
+                  record = record_from_text(
+                      block.get("text", ""),
+                      block.get("area_hint", ""),
+                      block.get("source_method", "structured-browser-network"),
+                  )
+                  if not record:
+                      continue
+                  signature = key(f"{record['area']}|{record['title']}")
+                  if signature in seen:
+                      continue
+                  seen.add(signature)
+                  records.append(record)
+              return records
+          
+          
+          def dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+              chosen: dict[str, dict[str, Any]] = {}
+              priority = {
+                  "rendered-visible-card": 3,
+                  "rendered-visible-text-window": 2,
+                  "structured-browser-network": 1,
+              }
+              for record in records:
+                  parts = [
+                      clean(record.get("alert_phase")),
+                      clean(record.get("warning_level")),
+                      clean(record.get("action")),
+                  ]
+                  operational = "|".join(part for part in parts if part)
+                  signature = key(
+                      f"{record.get('area')}|{operational or record.get('title')}"
+                  )
+                  if not signature:
+                      continue
+                  previous = chosen.get(signature)
+                  if previous is None or priority.get(record.get("source_method", ""), 0) > priority.get(previous.get("source_method", ""), 0):
+                      chosen[signature] = record
+              return sorted(chosen.values(), key=lambda item: (item.get("area", ""), item.get("title", "")))
+          
+          
           def write_error(message: str, diagnostic: dict[str, Any] | None = None) -> None:
               payload = {
                   "schema": "msq-browser-current-v2",
@@ -781,20 +759,26 @@ jobs:
                   "captured_at": datetime.now(timezone.utc).isoformat(),
                   "source_url": URL,
                   "warnings": [],
-                  "error": clean(message)[:1500],
+                  "error": clean(message)[:1800],
               }
               OUT.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
               if diagnostic is not None:
-                  DIAGNOSTIC.write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-              print(f"::warning::MSQ browser capture unavailable: {payload['error']}")
-
-
+                  DIAGNOSTIC.write_text(
+                      json.dumps(diagnostic, ensure_ascii=False, indent=2, default=str),
+                      encoding="utf-8",
+                  )
+              print(f"::warning::MSQ capture unavailable: {payload['error']}")
+          
+          
           def main() -> int:
-              network_payloads: list[dict[str, Any]] = []
-              body_text_parts: list[str] = []
-              response_urls: list[str] = []
-              xhr_summaries: list[dict[str, Any]] = []
-              dom_blocks: list[dict[str, Any]] = []
+              captured: dict[str, Any] = {"bulletin": None, "bulletin_url": ""}
+              response_summaries: list[dict[str, Any]] = []
+              before_text = ""
+              after_text = ""
+              modal_blocks: list[dict[str, Any]] = []
+              clicked = False
+              expected_count: int | None = None
+          
               try:
                   with sync_playwright() as p:
                       browser_path = clean(os.environ.get("MSQ_BROWSER_PATH"))
@@ -802,106 +786,195 @@ jobs:
                       if browser_path:
                           launch_kwargs["executable_path"] = browser_path
                       browser = p.chromium.launch(**launch_kwargs)
-                      context = browser.new_context(locale="en-AU", timezone_id="Australia/Brisbane", viewport={"width": 1440, "height": 1200})
+                      context = browser.new_context(
+                          locale="en-AU",
+                          timezone_id="Australia/Brisbane",
+                          viewport={"width": 1440, "height": 1200},
+                      )
                       page = context.new_page()
-
+          
                       def on_response(response) -> None:
                           try:
-                              resource_type = response.request.resource_type
-                              content_type = response.headers.get("content-type", "").lower()
                               url = response.url
-                              if resource_type not in {"xhr", "fetch"} and "json" not in content_type:
-                                  return
-                              response_urls.append(url)
-                              body = response.body()
-                              if len(body) > 5_000_000:
-                                  return
-                              xhr_summaries.append({"url": url, "resource_type": resource_type, "content_type": content_type, "bytes": len(body)})
-                              try:
-                                  data = json.loads(body.decode("utf-8-sig", errors="replace"))
-                              except Exception:
-                                  return
-                              network_payloads.append({"url": url, "data": data})
+                              resource_type = response.request.resource_type
+                              content_type = response.headers.get("content-type", "")
+                              if "qldmaritime.msq.qld.gov.au/dashboard/" in url:
+                                  body = response.body()
+                                  response_summaries.append(
+                                      {
+                                          "url": url,
+                                          "resource_type": resource_type,
+                                          "content_type": content_type,
+                                          "bytes": len(body),
+                                      }
+                                  )
+                                  if "/dashboard/imsBulletin" in url:
+                                      captured["bulletin_url"] = url
+                                      try:
+                                          captured["bulletin"] = json.loads(body.decode("utf-8-sig"))
+                                      except Exception:
+                                          captured["bulletin"] = body.decode("utf-8", errors="replace")
                           except Exception:
                               return
-
+          
                       page.on("response", on_response)
                       page.goto(URL, wait_until="domcontentloaded", timeout=90_000)
+                      page.wait_for_timeout(10_000)
+          
+                      before_text = page.locator("body").inner_text(timeout=10_000)
+                      count_match = re.search(r"\b(\d+)\s+Latest\s+Warnings\b", before_text, re.I)
+                      if count_match:
+                          expected_count = int(count_match.group(1))
+          
                       try:
-                          page.wait_for_load_state("networkidle", timeout=25_000)
+                          page.screenshot(path=str(SCREENSHOT), full_page=True)
                       except Exception:
                           pass
-                      page.wait_for_timeout(8_000)
-                      for fraction in (0.0, 0.25, 0.5, 0.75, 1.0, 0.0):
+          
+                      # The diagnostic screenshot proved the current warning list is behind this tile.
+                      latest = page.get_by_text(re.compile(r"^\s*Latest\s+Warnings\s*$", re.I), exact=False)
+                      if latest.count():
+                          target = latest.first
                           try:
-                              page.evaluate("fraction => window.scrollTo(0, document.body.scrollHeight * fraction)", fraction)
+                              target.scroll_into_view_if_needed(timeout=5_000)
                           except Exception:
                               pass
-                          page.wait_for_timeout(1_000)
-
+                          try:
+                              target.click(timeout=10_000, force=True)
+                              clicked = True
+                          except Exception:
+                              try:
+                                  clicked = bool(
+                                      target.evaluate(
+                                          r"""el => {
+                                            const clickable =
+                                              el.closest('button,a,[role="button"],[onclick],.dashboard-widget,.widget,.tile') ||
+                                              el.parentElement ||
+                                              el;
+                                            clickable.click();
+                                            return true;
+                                          }"""
+                                      )
+                                  )
+                              except Exception:
+                                  clicked = False
+          
+                      if clicked:
+                          page.wait_for_timeout(3_500)
+          
+                      body_parts: list[str] = []
                       for frame in page.frames:
                           try:
-                              raw_body = frame.locator("body").inner_text(timeout=5_000)
-                              if raw_body:
-                                  body_text_parts.append(raw_body)
-                          except Exception:
-                              raw_body = ""
-                          try:
-                              dom_blocks.extend(composed_area_blocks(frame))
+                              body_parts.append(frame.locator("body").inner_text(timeout=5_000))
                           except Exception:
                               pass
-
+                          try:
+                              modal_blocks.extend(modal_area_blocks(frame))
+                          except Exception:
+                              pass
+                      after_text = "\n".join(body_parts)
+          
                       try:
-                          page.screenshot(path="/tmp/msq-current-dashboard.png", full_page=True)
+                          page.screenshot(path=str(MODAL_SCREENSHOT), full_page=True)
                       except Exception:
                           pass
                       browser.close()
-
-                  body_text_raw = "\n".join(body_text_parts)
-                  body_blocks = body_area_windows(body_text_raw)
-                  visible_areas: set[str] = set(areas_in_text(body_text_raw))
-                  for block in dom_blocks + body_blocks:
-                      visible_areas.update(areas_in_text(clean(block.get("text"))))
-                      hint = clean(block.get("area_hint"))
-                      if hint:
-                          visible_areas.add(hint)
-
-                  network_details = network_detail_candidates(network_payloads, visible_areas)
-                  warnings = select_warnings(dom_blocks, body_blocks, network_details)
-                  verified_zero = not warnings and any(phrase in key(body_text_raw) for phrase in ZERO_PHRASES)
+          
+                  if captured["bulletin"] is not None:
+                      BULLETIN.write_text(
+                          json.dumps(
+                              {
+                                  "url": captured.get("bulletin_url"),
+                                  "payload": captured["bulletin"],
+                              },
+                              ensure_ascii=False,
+                              indent=2,
+                              default=str,
+                          ),
+                          encoding="utf-8",
+                      )
+          
+                  rendered_records: list[dict[str, Any]] = []
+                  for block in modal_blocks:
+                      record = record_from_text(
+                          block.get("text", ""),
+                          block.get("area_hint", ""),
+                          block.get("source_method", "rendered-visible-card"),
+                      )
+                      if record:
+                          rendered_records.append(record)
+          
+                  # A line-window pass is deliberately limited to the post-click rendered text.
+                  for block in area_windows_from_lines(after_text):
+                      record = record_from_text(
+                          block.get("text", ""),
+                          block.get("area_hint", ""),
+                          block.get("source_method", "rendered-visible-text-window"),
+                      )
+                      if record:
+                          rendered_records.append(record)
+          
+                  network_records = bulletin_records(captured["bulletin"])
+                  warnings = dedupe_records(rendered_records + network_records)
+          
+                  verified_zero = False
+                  if expected_count == 0:
+                      verified_zero = True
+                  elif expected_count is None:
+                      verified_zero = not warnings and any(phrase in key(after_text) for phrase in ZERO_PHRASES)
+          
                   diagnostic = {
                       "captured_at": datetime.now(timezone.utc).isoformat(),
-                      "response_urls": sorted(set(response_urls))[:400],
-                      "xhr_summaries": xhr_summaries[:400],
-                      "json_response_count": len(network_payloads),
-                      "visible_areas": sorted(visible_areas),
-                      "dom_candidate_count": len(dom_blocks),
-                      "body_window_count": len(body_blocks),
-                      "network_candidate_count": len(network_details),
+                      "latest_warnings_expected_count": expected_count,
+                      "latest_warnings_tile_clicked": clicked,
+                      "imsBulletin_url": captured.get("bulletin_url"),
+                      "imsBulletin_captured": captured["bulletin"] is not None,
+                      "dashboard_responses": response_summaries,
+                      "rendered_modal_candidate_count": len(modal_blocks),
+                      "rendered_record_count": len(dedupe_records(rendered_records)),
+                      "imsBulletin_record_count": len(network_records),
                       "selected_warning_count": len(warnings),
                       "selected_warnings": warnings,
-                      "body_excerpt": clean(body_text_raw)[:25000],
+                      "before_click_excerpt": clean(before_text)[:8000],
+                      "after_click_excerpt": clean(after_text)[:20000],
                   }
-                  DIAGNOSTIC.write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-
-                  print(
-                      "MSQ browser diagnostics: "
-                      f"visible_areas={len(visible_areas)} dom={len(dom_blocks)} body_windows={len(body_blocks)} "
-                      f"json={len(network_payloads)} network_candidates={len(network_details)} selected={len(warnings)}"
+                  DIAGNOSTIC.write_text(
+                      json.dumps(diagnostic, ensure_ascii=False, indent=2, default=str),
+                      encoding="utf-8",
                   )
-                  for candidate in network_details[:10]:
-                      print(f"  network candidate [{candidate.get('area')}]: {candidate.get('title')} <- {candidate.get('network_url')}")
-
-                  if len(warnings) > 20:
-                      write_error(f"ambiguous rendered dashboard: extracted {len(warnings)} warning records", diagnostic)
-                      return 0
-                  if not warnings and not verified_zero:
+          
+                  print(
+                      "MSQ diagnostics:"
+                      f" expected={expected_count}"
+                      f" clicked={clicked}"
+                      f" modal_candidates={len(modal_blocks)}"
+                      f" rendered={len(dedupe_records(rendered_records))}"
+                      f" bulletin={len(network_records)}"
+                      f" selected={len(warnings)}"
+                  )
+                  if captured.get("bulletin_url"):
+                      print(f"MSQ imsBulletin endpoint: {captured['bulletin_url']}")
+          
+                  if expected_count is not None and expected_count > 0:
+                      if not clicked and not network_records:
+                          write_error(
+                              f"MSQ reports {expected_count} Latest Warnings, but the Latest Warnings tile could not be opened and imsBulletin yielded no verified records",
+                              diagnostic,
+                          )
+                          return 0
+                      if len(warnings) != expected_count:
+                          write_error(
+                              f"MSQ reports {expected_count} Latest Warnings, but {len(warnings)} area-specific warning record(s) were verified after opening the warning list",
+                              diagnostic,
+                          )
+                          return 0
+                  elif expected_count is None and not warnings and not verified_zero:
                       write_error(
-                          "the dashboard rendered, but no verified area-specific current warnings could be established from rendered content or structured browser network data",
+                          "MSQ Latest Warnings count could not be read and no verified current warning records were extracted",
                           diagnostic,
                       )
                       return 0
-
+          
                   payload = {
                       "schema": "msq-browser-current-v2",
                       "status": "current",
@@ -910,22 +983,24 @@ jobs:
                       "source_url": URL,
                       "warnings": warnings,
                       "diagnostics": {
-                          "json_response_count": len(network_payloads),
-                          "dom_candidate_count": len(dom_blocks),
-                          "body_window_count": len(body_blocks),
-                          "network_candidate_count": len(network_details),
+                          "expected_count": expected_count,
+                          "tile_clicked": clicked,
+                          "imsBulletin_captured": captured["bulletin"] is not None,
                       },
                   }
                   OUT.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                  print(f"MSQ browser source verified: {len(warnings)} current warning(s).")
+                  print(f"MSQ warning list verified: {len(warnings)} current warning(s).")
                   for warning in warnings:
-                      print(f"  - {warning.get('area')}: {warning.get('title')} [{warning.get('source_method')}]")
+                      print(f"  - {warning.get('area')}: {warning.get('title')}")
                   return 0
               except Exception as exc:
-                  write_error(f"{type(exc).__name__}: {exc}", {"traceback": traceback.format_exc()})
+                  write_error(
+                      f"{type(exc).__name__}: {exc}",
+                      {"traceback": traceback.format_exc()},
+                  )
                   return 0
-
-
+          
+          
           if __name__ == "__main__":
               raise SystemExit(main())
           PY
@@ -950,7 +1025,9 @@ jobs:
           path: |
             /tmp/msq-current-diagnostic.json
             /tmp/msq-current-dashboard.png
+            /tmp/msq-current-modal.png
             /tmp/msq-current-warnings.json
+            /tmp/msq-imsBulletin.json
           if-no-files-found: ignore
           retention-days: 3
 
