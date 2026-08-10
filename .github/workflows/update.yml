@@ -6,6 +6,7 @@ on:
     paths:
       - index.html
       - refresh.py
+      - apply_qldtraffic_fix.py
       - requirements.txt
       - .github/workflows/update.yml
   schedule:
@@ -51,6 +52,9 @@ jobs:
             python -m pip install -r requirements.txt
           fi
 
+      - name: Apply QLDTraffic Hazard/Flooding filter
+        run: python apply_qldtraffic_fix.py
+
       - name: Refresh live feeds
         run: python refresh.py
 
@@ -62,15 +66,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add index.html
+          git add refresh.py index.html
 
           if git diff --cached --quiet; then
-            echo "No snapshot change to commit."
+            echo "No snapshot or parser change to commit."
             exit 0
           fi
 
-          # [skip ci] prevents this bot-generated index.html commit from
-          # starting another identical push-triggered workflow.
+          # [skip ci] prevents this bot-generated commit from starting
+          # another identical push-triggered workflow.
           git commit -m "data: refresh dashboard [skip ci]"
 
           for attempt in 1 2 3; do
@@ -82,13 +86,14 @@ jobs:
             fi
 
             echo "Remote main changed before the push completed."
-            echo "Refreshing again from the latest main branch."
+            echo "Resetting to latest main, re-applying the filter, and refreshing."
 
             git fetch origin main
             git reset --hard origin/main
 
+            python apply_qldtraffic_fix.py
             python refresh.py
-            git add index.html
+            git add refresh.py index.html
 
             if git diff --cached --quiet; then
               echo "Latest main already contains equivalent dashboard data."
