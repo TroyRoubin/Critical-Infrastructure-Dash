@@ -686,19 +686,41 @@ jobs:
           
           
           def validate_refresh(text: str) -> None:
+              # The base Marine KPI is applied before the location/detail upgrades.
+              # On later scheduled runs refresh.py may already contain the upgraded
+              # two-argument parser and job call, so validation must accept both
+              # the original and upgraded forms.
               required = (
                   REFRESH_MARKER,
                   '"marine": {',
                   '"name": "Maritime Safety Queensland"',
                   f'"url": "{MSQ_URL}"',
-                  'def parse_msq_marine_warnings(html_data: bytes)',
                   '"sector": "marine"',
-                  '("marine", lambda: parse_msq_marine_warnings(get_bytes(SOURCES["marine"]["url"]))),',
                   'raise RuntimeError("Unable to verify the active maritime-warning state from the MSQ dashboard")',
               )
               for token in required:
                   if token not in text:
                       raise RuntimeError(f"Marine refresh patch validation failed: missing {token!r}.")
+
+              parser_forms = (
+                  'def parse_msq_marine_warnings(html_data: bytes)',
+                  'def parse_msq_marine_warnings(html_data: bytes, lgas: dict[str, Any])',
+              )
+              if not any(token in text for token in parser_forms):
+                  raise RuntimeError(
+                      "Marine refresh patch validation failed: missing a supported "
+                      "parse_msq_marine_warnings() signature."
+                  )
+
+              job_forms = (
+                  '("marine", lambda: parse_msq_marine_warnings(get_bytes(SOURCES["marine"]["url"]))),',
+                  '("marine", lambda: parse_msq_marine_warnings(get_bytes(SOURCES["marine"]["url"]), lgas)),',
+              )
+              if not any(token in text for token in job_forms):
+                  raise RuntimeError(
+                      "Marine refresh patch validation failed: missing a supported Marine refresh job call."
+                  )
+
               compile(text, str(REFRESH), "exec")
           
           
