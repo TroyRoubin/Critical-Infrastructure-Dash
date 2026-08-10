@@ -31,7 +31,7 @@ try:
 except ImportError:  # pragma: no cover - Python 3.8 fallback
     ZoneInfo = None  # type: ignore[assignment]
 
-SCRIPT_VERSION = "2026-08-10-qldtraffic-hazards-flooding-v5"
+SCRIPT_VERSION = "2026-08-10-qldtraffic-strict-hazards-flooding-v6"
 
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "index.html"
@@ -399,15 +399,25 @@ def fetch_lgas() -> dict[str, Any]:
     return {"type": "FeatureCollection", "features": features}
 
 
-QLDTRAFFIC_ALLOWED_EVENT_TYPES = {"hazard", "hazards", "flooding"}
+QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
+
+
+def qldtraffic_event_category(properties: dict[str, Any]) -> str | None:
+    """Return the only QLDTraffic current-alert categories used by this dashboard.
+
+    QLDTraffic's full feed also contains crashes, congestion, roadworks and
+    special events. Those categories are intentionally excluded.
+    """
+    event_type = norm(properties.get("event_type"))
+    if event_type.startswith("hazard"):
+        return "hazard"
+    if event_type.startswith("flood"):
+        return "flooding"
+    return None
 
 
 def qldtraffic_access_subtype(impact: dict[str, Any]) -> str | None:
-    """Classify only closures and access restrictions from QLDTraffic.
-
-    QLDTraffic uses a range of restriction labels, including vehicle-class and
-    load-limit wording, so do not rely only on the literal word ``restriction``.
-    """
+    """Classify only closures and genuine access restrictions."""
     combined = norm(f"{impact.get('impact_type')} {impact.get('impact_subtype')}")
     if re.search(r"\b(?:closure|closed)\b", combined):
         return "closure"
@@ -425,38 +435,60 @@ def qldtraffic_access_subtype(impact: dict[str, Any]) -> str | None:
     return None
 
 
+def qldtraffic_fallback_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only road records previously validated by the strict v6 parser.
+
+    Pre-v6 road records do not contain ``event_category``. Reusing those after
+    a feed failure can resurrect roadworks, crashes, congestion or special
+    events that are no longer permitted. Untagged legacy road records are
+    therefore deliberately discarded rather than displayed as misleading data.
+    """
+    return [
+        item
+        for item in records
+        if item.get("sector") == "roads"
+        and norm(item.get("event_category")) in QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES
+        and item.get("subtype") in {"closure", "restriction"}
+    ]
+
+
 def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str, Any]]:
     incidents = []
     for feature in payload.get("features", []):
         props = feature.get("properties") or {}
+
         if norm(props.get("status")) not in {"", "active", "published"}:
             continue
 
-        # Match the QLDTraffic map filter requested for the dashboard:
-        # Current alerts -> Hazards + Flooding only. Crashes, congestion,
-        # roadworks and special events are deliberately excluded.
-        event_type = norm(props.get("event_type"))
-        if event_type not in QLDTRAFFIC_ALLOWED_EVENT_TYPES:
+        # CATEGORY GATE FIRST: a Roadworks/Crash/Congestion/Special Event
+        # closure must never enter merely because its impact says "road closed".
+        event_category = qldtraffic_event_category(props)
+        if event_category is None:
             continue
 
         impact = props.get("impact") or {}
         subtype = qldtraffic_access_subtype(impact)
         if subtype is None:
+            # Hazards/Flooding that do not actually close or restrict access are
+            # outside the road-impact scope of this dashboard.
             continue
 
         duration = props.get("duration") or {}
         if not active_now(duration.get("start"), duration.get("end")):
             continue
+
         summary = props.get("road_summary") or {}
         geometry = feature.get("geometry")
         coords = representative_point(geometry)
         lga = clean(summary.get("local_government_area")) or locate_lga(coords, lgas)
         road = clean(summary.get("road_name")) or "Queensland road"
         status = clean(impact.get("impact_subtype") or impact.get("impact_type")) or title_case(subtype)
+
         incidents.append({
             "id": f"roads-{props.get('id') or stable_id(road, status, duration.get('start'))}",
             "sector": "roads",
             "subtype": subtype,
+            "event_category": event_category,
             "title": f"{road}: {status}",
             "description": clean(props.get("description")),
             "status": status,
@@ -470,8 +502,8 @@ def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str,
             "source_name": "QLDTraffic",
             "source_url": OFFICIAL_SOURCE_URLS["qldtraffic"],
         })
-    return incidents
 
+    return incidents
 
 def property_value(properties: dict[str, Any], *names: str) -> Any:
     index = {re.sub(r"[^a-z0-9]", "", str(key).lower()): value for key, value in properties.items()}
@@ -1312,12 +1344,43 @@ def main() -> int:
                 record["source_key"] = key
             incidents.extend(records)
             sources[key] = source_result(key, "current", len(records))
-            print(f"{SOURCES[key]['name']}: {len(records)} records")
+
+            if key == "qldtraffic":
+                hazard_count = sum(record.get("event_category") == "hazard" for record in records)
+                flooding_count = sum(record.get("event_category") == "flooding" for record in records)
+                closure_count = sum(record.get("subtype") == "closure" for record in records)
+                restriction_count = sum(record.get("subtype") == "restriction" for record in records)
+                print(
+                    "QLDTraffic filtered records: "
+                    f"{len(records)} "
+                    f"(hazards={hazard_count}, flooding={flooding_count}, "
+                    f"closures={closure_count}, restrictions={restriction_count})"
+                )
+            else:
+                print(f"{SOURCES[key]['name']}: {len(records)} records")
+
         except Exception as exc:  # noqa: BLE001
             fallback = previous_by_source.get(key, [])
+
+            if key == "qldtraffic":
+                # Critical safety rule: pre-v6 QLDTraffic records are untagged
+                # and may contain categories the user explicitly excluded.
+                fallback = qldtraffic_fallback_records(fallback)
+                print(
+                    "QLDTraffic: ERROR - "
+                    f"{exc}. Retaining {len(fallback)} previously verified "
+                    "Hazard/Flooding closure/restriction records."
+                )
+            else:
+                print(f"{SOURCES[key]['name']}: ERROR - {exc}")
+
             incidents.extend(fallback)
-            sources[key] = source_result(key, "fallback" if fallback else "error", len(fallback), str(exc))
-            print(f"{SOURCES[key]['name']}: ERROR - {exc}")
+            sources[key] = source_result(
+                key,
+                "fallback" if fallback else "error",
+                len(fallback),
+                str(exc),
+            )
 
     history = update_kpi_history(previous, incidents, lgas)
     change_history = update_change_history(previous, previous_incidents, incidents, lgas)
