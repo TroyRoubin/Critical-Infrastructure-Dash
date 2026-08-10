@@ -6,11 +6,9 @@ on:
     paths:
       - index.html
       - refresh.py
-      - apply_qldtraffic_fix.py
       - requirements.txt
       - .github/workflows/update.yml
   schedule:
-    # Every 15 minutes, offset from the busiest start-of-hour period.
     - cron: "2,17,32,47 * * * *"
   workflow_dispatch:
 
@@ -52,8 +50,181 @@ jobs:
             python -m pip install -r requirements.txt
           fi
 
-      - name: Apply QLDTraffic Hazard/Flooding filter
-        run: python apply_qldtraffic_fix.py
+      - name: Repair refresh.py and apply Hazard/Flooding filter
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GOOD_REFRESH_COMMIT="a30369b2f3308aaad9fb448744a9f6aa0411e38f"
+
+          repair_refresh() {
+            if [[ ! -f refresh.py ]]; then
+              echo "refresh.py is missing; restoring known-good version."
+              git show "${GOOD_REFRESH_COMMIT}:refresh.py" > refresh.py
+              return
+            fi
+
+            if grep -q 'Apply the Critical Infrastructure Dashboard QLDTraffic KPI fix' refresh.py; then
+              echo "refresh.py contains the patch-helper instead of the dashboard refresher."
+              echo "Restoring known-good refresh.py before applying the filter."
+              git show "${GOOD_REFRESH_COMMIT}:refresh.py" > refresh.py
+              return
+            fi
+
+            if ! grep -q 'Refresh the data embedded in index.html' refresh.py; then
+              echo "refresh.py does not look like the dashboard refresher."
+              echo "Restoring known-good refresh.py."
+              git show "${GOOD_REFRESH_COMMIT}:refresh.py" > refresh.py
+            fi
+          }
+
+          cat > /tmp/apply_qldtraffic_filter.py <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+          import re
+
+          path = Path("refresh.py")
+          text = path.read_text(encoding="utf-8")
+
+          marker = "# QLDTraffic filter: Hazard + Flooding only"
+
+          new_roads = r'''
+          # QLDTraffic filter: Hazard + Flooding only
+          QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}
+
+
+          def qldtraffic_event_category(properties: dict[str, Any]) -> str | None:
+              category = norm(properties.get("event_type"))
+              return category if category in QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES else None
+
+
+          def qldtraffic_fallback_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+              filtered = []
+              for item in records:
+                  category = norm(item.get("event_category") or item.get("event_type"))
+                  if category in QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES:
+                      filtered.append(item)
+              return filtered
+
+
+          def parse_roads(payload: dict[str, Any], lgas: dict[str, Any]) -> list[dict[str, Any]]:
+              incidents = []
+
+              for feature in payload.get("features", []):
+                  props = feature.get("properties") or {}
+
+                  event_category = qldtraffic_event_category(props)
+                  if event_category is None:
+                      continue
+
+                  if norm(props.get("status")) not in {"", "active", "published"}:
+                      continue
+
+                  duration = props.get("duration") or {}
+                  if not active_now(duration.get("start"), duration.get("end")):
+                      continue
+
+                  impact = props.get("impact") or {}
+                  impact_type = clean(impact.get("impact_type"))
+                  impact_subtype = clean(impact.get("impact_subtype"))
+                  combined = norm(f"{impact_type} {impact_subtype}")
+
+                  if "closure" in combined or "closed" in combined:
+                      subtype = "closure"
+                  elif "lane" in combined or "restriction" in combined:
+                      subtype = "restriction"
+                  else:
+                      subtype = "incident"
+
+                  summary = props.get("road_summary") or {}
+                  geometry = feature.get("geometry")
+                  coords = representative_point(geometry)
+                  lga = clean(summary.get("local_government_area")) or locate_lga(coords, lgas)
+                  road = clean(summary.get("road_name")) or "Queensland road"
+
+                  event_type = clean(props.get("event_type")) or title_case(event_category)
+                  event_subtype = clean(props.get("event_subtype"))
+                  event_due_to = clean(props.get("event_due_to"))
+                  status = impact_subtype or impact_type or event_subtype or event_type
+
+                  incidents.append({
+                      "id": f"roads-{props.get('id') or stable_id(road, event_type, duration.get('start'))}",
+                      "sector": "roads",
+                      "subtype": subtype,
+                      "event_category": event_category,
+                      "event_type": event_type,
+                      "event_subtype": event_subtype,
+                      "event_due_to": event_due_to,
+                      "title": f"{road}: {status or event_type}",
+                      "description": clean(props.get("description")),
+                      "status": status,
+                      "lga": lga,
+                      "locality": clean(summary.get("locality")),
+                      "coordinates": coords,
+                      "geometry": geometry,
+                      "customers": 0,
+                      "planned": False,
+                      "updated": iso(props.get("last_updated")) or NOW_ISO,
+                      "source_name": "QLDTraffic",
+                      "source_url": clean(props.get("url") or props.get("web_link"))
+                          or SOURCES["qldtraffic"]["url"],
+                  })
+
+              return incidents
+
+
+          '''
+
+          if marker not in text:
+              parse_pattern = re.compile(
+                  r"(?ms)^def parse_roads\([^\n]*\)"
+                  r"(?:\s*->\s*[^:\n]+)?"
+                  r":\n.*?"
+                  r"(?=^def [A-Za-z_][A-Za-z0-9_]*\(|\Z)"
+              )
+              match = parse_pattern.search(text)
+              if not match:
+                  raise SystemExit("Could not locate parse_roads() in refresh.py.")
+
+              text = text[:match.start()] + new_roads + text[match.end():]
+
+          if "qldtraffic_fallback_records(previous_by_source.get(key, []))" not in text:
+              fallback_pattern = re.compile(
+                  r"(?m)^(?P<indent>[ \t]+)fallback = previous_by_source\.get\(key, \[\]\)[ \t]*$"
+              )
+              match = fallback_pattern.search(text)
+              if not match:
+                  raise SystemExit("Could not locate the source fallback in refresh.py.")
+
+              indent = match.group("indent")
+              replacement = (
+                  f"{indent}fallback = (\n"
+                  f"{indent}    qldtraffic_fallback_records(previous_by_source.get(key, []))\n"
+                  f'{indent}    if key == "qldtraffic"\n'
+                  f"{indent}    else previous_by_source.get(key, [])\n"
+                  f"{indent})"
+              )
+              text = text[:match.start()] + replacement + text[match.end():]
+
+          required = [
+              marker,
+              '"event_category": event_category',
+              'QLDTRAFFIC_ALLOWED_EVENT_CATEGORIES = {"hazard", "flooding"}',
+              "qldtraffic_fallback_records(previous_by_source.get(key, []))",
+          ]
+          for token in required:
+              if token not in text:
+                  raise SystemExit(f"QLDTraffic patch validation failed: missing {token}")
+
+          compile(text, str(path), "exec")
+          path.write_text(text, encoding="utf-8")
+          print("QLDTraffic road KPI filter applied: Hazard + Flooding only.")
+          PY
+
+          repair_refresh
+          python /tmp/apply_qldtraffic_filter.py
+          python -m py_compile refresh.py
 
       - name: Refresh live feeds
         run: python refresh.py
@@ -62,6 +233,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          GOOD_REFRESH_COMMIT="a30369b2f3308aaad9fb448744a9f6aa0411e38f"
+
+          repair_refresh() {
+            if [[ ! -f refresh.py ]] || \
+               grep -q 'Apply the Critical Infrastructure Dashboard QLDTraffic KPI fix' refresh.py || \
+               ! grep -q 'Refresh the data embedded in index.html' refresh.py; then
+              git show "${GOOD_REFRESH_COMMIT}:refresh.py" > refresh.py
+            fi
+          }
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -73,8 +254,6 @@ jobs:
             exit 0
           fi
 
-          # [skip ci] prevents this bot-generated commit from starting
-          # another identical push-triggered workflow.
           git commit -m "data: refresh dashboard [skip ci]"
 
           for attempt in 1 2 3; do
@@ -85,13 +264,14 @@ jobs:
               exit 0
             fi
 
-            echo "Remote main changed before the push completed."
-            echo "Resetting to latest main, re-applying the filter, and refreshing."
+            echo "Remote main changed. Rebuilding against latest main."
 
             git fetch origin main
             git reset --hard origin/main
 
-            python apply_qldtraffic_fix.py
+            repair_refresh
+            python /tmp/apply_qldtraffic_filter.py
+            python -m py_compile refresh.py
             python refresh.py
             git add refresh.py index.html
 
@@ -104,7 +284,7 @@ jobs:
             sleep $((attempt * 2))
           done
 
-          echo "Unable to push the refreshed dashboard after three attempts."
+          echo "Unable to push refreshed dashboard after three attempts."
           exit 1
 
       - name: Prepare site
